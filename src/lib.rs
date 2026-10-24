@@ -1,6 +1,60 @@
+//! A typestate regex builder with a hierarchical capture-result model.
+//!
+//! # Overview
+//!
+//! Patterns are assembled with [`RegexBuilder`], whose type parameter tracks
+//! what may legally come next (for example, a quantifier can only follow an
+//! atom). [`RegexBuilder::build`] validates the pattern and produces a
+//! [`Regex`]. [`Regex::collect`] matches an entire input string and returns
+//! [`Captures`].
+//!
+//! # Capture model
+//!
+//! * Every capture location is a *slot* inside a *scope*. Slots are either
+//!   unnamed (a zero-based index) or named.
+//! * Ordinary captures and nested regexes share one index space and one name
+//!   namespace per scope.
+//! * Every capture group and every nested regex opens its own scope. Inner
+//!   captures are never merged into the parent scope.
+//! * A slot yields a `[CaptureType]` slice with one entry per occurrence, in
+//!   the order the occurrences were produced. A repeated capture therefore
+//!   keeps every iteration, and each iteration of a group has its own nested
+//!   [`Captures`].
+//! * An empty slice means the slot's route was not taken. A one-element slice
+//!   holding an empty string means the slot matched the empty string. The two
+//!   are always distinguishable.
+//!
+//! ```ignore
+//! // (0: (1: a)*b)*   matched against "aabab"
+//! let regex = RegexBuilder::new()
+//!     .capture(|r| {
+//!         r.capture(|r| r.literal("a")).zero_or_more()
+//!             .literal("b")
+//!     })
+//!     .zero_or_more()
+//!     .build()
+//!     .unwrap();
+//!
+//! let caps = regex.collect("aabab").unwrap();
+//! let outer = caps.get(0).unwrap();          // two occurrences of capture 0
+//! assert_eq!(outer.len(), 2);
+//! assert_eq!(outer[0].full(), "aab");
+//! assert_eq!(outer[0].group().get(1).unwrap().len(), 2);   // "a", "a"
+//! assert_eq!(outer[1].group().get(1).unwrap().len(), 1);   // "a"
+//! ```
+//!
+//! Note that capture indexes are per scope. Capture `1` in the example above
+//! is index `0` inside the outer group's scope; the spec's numbering is
+//! conceptual. In code, `outer[0].group().get(0)` addresses the inner capture.
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// Builder states
+// ---------------------------------------------------------------------------
 
 /// A regex construction state marker.
 ///
@@ -23,6 +77,10 @@ pub struct QuantifiedGreedy;
 impl State for AppendOnly {}
 impl State for Quantifiable {}
 impl State for QuantifiedGreedy {}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
 
 /// Errors produced while constructing or validating a regular expression.
 #[derive(Debug, PartialEq, Clone)]
@@ -60,102 +118,198 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A single set of capture results produced by a successful match.
+// ---------------------------------------------------------------------------
+// Public capture results
+// ---------------------------------------------------------------------------
+
+/// A single occurrence of a capture location.
 ///
-/// The structure is scoped to one regex level. Unnamed captures and unnamed
-/// nested regexes each have their own zero-based index order. Named captures and
-/// named nested regexes share the same name namespace at that level.
+/// The variant describes the *kind* of capture, not whether it matched: both
+/// variants always represent a successful match of that occurrence.
+///
+/// * [`CaptureType::Group`] is a capture (or nested regex) that contains its
+///   own capture locations. It carries the nested [`Captures`] of this
+///   occurrence.
+/// * [`CaptureType::Literal`] is a capture that contains no capture locations
+///   of its own, so only its matched text is retained.
+///
+/// A capture is a `Group` if and only if its inner scope declares at least one
+/// capture location (capture or nested regex). Nested regexes are always
+/// groups, even if they declare no captures themselves.
+#[derive(Debug, PartialEq)]
+pub enum CaptureType {
+    /// A capture with a nested capture scope.
+    Group {
+        /// The complete text consumed by this group occurrence, including text
+        /// matched by expressions that are not individually addressable.
+        full: String,
+        /// The captures declared inside this occurrence.
+        captures: Captures,
+    },
+
+    /// A capture without nested capture locations.
+    Literal(String),
+}
+
+impl CaptureType {
+    /// Returns the complete text matched by this occurrence.
+    ///
+    /// Works for both variants. For repeated captures, each occurrence returns
+    /// only its own text, never a concatenation of all occurrences.
+    pub fn full(&self) -> &str {
+        match self {
+            CaptureType::Group { full, .. } | CaptureType::Literal(full) => full,
+        }
+    }
+
+    /// Returns the nested captures if this is a `Group`, otherwise `None`.
+    pub fn as_group(&self) -> Option<&Captures> {
+        match self {
+            CaptureType::Group { captures, .. } => Some(captures),
+            CaptureType::Literal(_) => None,
+        }
+    }
+
+    /// Returns the matched text if this is a `Literal`, otherwise `None`.
+    pub fn as_literal(&self) -> Option<&str> {
+        match self {
+            CaptureType::Literal(text) => Some(text),
+            CaptureType::Group { .. } => None,
+        }
+    }
+
+    /// Returns the nested captures of a `Group`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is a `Literal`. Use [`CaptureType::as_group`] for a
+    /// non-panicking alternative.
+    pub fn group(&self) -> &Captures {
+        self.as_group()
+            .expect("group() called on a Literal capture")
+    }
+
+    /// Returns the matched text of a `Literal`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is a `Group`. Use [`CaptureType::as_literal`] for a
+    /// non-panicking alternative, or [`CaptureType::full`] which works for both.
+    pub fn literal(&self) -> &str {
+        self.as_literal()
+            .expect("literal() called on a Group capture")
+    }
+}
+
+/// The capture results of one regex scope.
+///
+/// Unnamed captures and unnamed nested regexes share a single zero-based index
+/// space. Named captures and named nested regexes share a single name
+/// namespace. Both accessors return the same kind of result: the ordered
+/// occurrences of that capture location.
+///
+/// Accessors distinguish three situations:
+///
+/// * `None`: the location does not exist in this scope (index out of range or
+///   unknown name).
+/// * `Some(&[])`: the location exists but its route was not taken.
+/// * `Some(&[..])`: one entry per occurrence, in order of production.
 #[derive(Debug, PartialEq)]
 pub struct Captures {
-    unnamed: Vec<String>,
-    named: HashMap<String, String>,
-    unnamed_regexes: Vec<Captures>,
-    named_regexes: HashMap<String, Captures>,
+    unnamed: Vec<Vec<CaptureType>>,
+    named: HashMap<String, Vec<CaptureType>>,
 }
 
 impl Captures {
-    /// Returns the value of the nth unnamed capture, counting from zero.
-    pub fn get(&self, index: usize) -> Option<&str> {
-        self.unnamed.get(index).map(String::as_str)
+    /// Returns the occurrences of the nth unnamed capture or unnamed nested
+    /// regex in this scope, counting from zero.
+    pub fn get(&self, index: usize) -> Option<&[CaptureType]> {
+        self.unnamed.get(index).map(Vec::as_slice)
     }
 
-    /// Returns the value associated with a named capture.
-    pub fn named(&self, name: impl AsRef<str>) -> Option<&str> {
-        self.named.get(name.as_ref()).map(String::as_str)
-    }
-
-    /// Returns the captures produced by the nth unnamed nested regex.
-    pub fn get_regex(&self, index: usize) -> Option<&Captures> {
-        self.unnamed_regexes.get(index)
-    }
-
-    /// Returns the captures produced by a named nested regex.
-    pub fn named_regex(&self, name: impl AsRef<str>) -> Option<&Captures> {
-        self.named_regexes.get(name.as_ref())
+    /// Returns the occurrences of a named capture or named nested regex in
+    /// this scope.
+    pub fn named(&self, name: impl AsRef<str>) -> Option<&[CaptureType]> {
+        self.named.get(name.as_ref()).map(Vec::as_slice)
     }
 }
 
-/// A slot used to store a capture span in a single regex scope.
+// ---------------------------------------------------------------------------
+// Internal match bookkeeping
+// ---------------------------------------------------------------------------
+
+/// A capture location within a single scope.
+///
+/// Ordinary captures and nested regexes both use this type, which is what
+/// gives them a shared index space and a shared name namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Slot {
-    /// A capture identified by its zero-based index.
+    /// A location identified by its zero-based index.
     Index(usize),
 
-    /// A capture identified by a user-defined name.
+    /// A location identified by a user-defined name.
     Name(String),
 }
 
-/// A slot used to store nested regex match data in a single regex scope.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum RegexSlot {
-    /// A nested regex identified by its zero-based index.
-    Index(usize),
-
-    /// A nested regex identified by a user-defined name.
-    Name(String),
-}
-
-/// A map of capture spans keyed by slot.
-type Spans = HashMap<Slot, (usize, usize)>;
-
-/// A sequence of possible match states for a pattern.
+/// A sequence of possible match states for a pattern: end position plus the
+/// captures collected on the way there.
 type Matches = Vec<(usize, MatchData)>;
 
-/// Match data collected while evaluating a regex pattern.
+/// Captures collected for one scope while evaluating a pattern.
+///
+/// Each slot maps to its occurrences in production order. Slots that were
+/// never reached simply have no entry; they are materialized as empty vectors
+/// when the final [`Captures`] is built.
 #[derive(Debug, Clone, Default)]
 struct MatchData {
-    /// Spans captured by the current regex level.
-    spans: Spans,
-
-    /// Nested regexes captured by the current regex level.
-    regexes: HashMap<RegexSlot, NestedMatch>,
+    slots: HashMap<Slot, Vec<Occurrence>>,
 }
 
-/// A nested regex match with its metadata.
+/// One recorded occurrence of a slot.
 #[derive(Debug, Clone)]
-struct NestedMatch {
-    /// The captured data for the nested regex match.
+struct Occurrence {
+    /// Half-open character span `[start, end)` consumed by this occurrence.
+    /// Retaining it lets `full()` return the exact matched text.
+    span: (usize, usize),
+
+    /// The nested scope of this occurrence: `Some` for group-like
+    /// occurrences, `None` for literal ones.
+    scope: Option<Scope>,
+}
+
+/// The nested scope belonging to one group occurrence.
+#[derive(Debug, Clone)]
+struct Scope {
+    /// Captures recorded inside this occurrence only.
     data: Box<MatchData>,
 
-    /// The metadata describing the nested regex capture structure.
-    metadata: RegexMetadata,
+    /// Describes which locations exist in this scope.
+    metadata: Arc<RegexMetadata>,
 }
 
-/// Static metadata describing the captures and nested regex names for one level.
-#[derive(Debug, Clone)]
+/// Static description of the capture locations declared in one scope.
+///
+/// It is what lets untaken routes be reported as empty vectors: every
+/// declared location is known even when it never matched.
+#[derive(Debug, Default)]
 struct RegexMetadata {
-    /// Number of unnamed captures in this regex scope.
+    /// Number of index slots: unnamed captures plus unnamed nested regexes.
     unnamed_count: usize,
 
-    /// Ordered list of named captures in this regex scope.
+    /// Names of named captures and named nested regexes (one shared namespace).
     names: Vec<String>,
-
-    /// Number of unnamed nested regexes in this regex scope.
-    unnamed_regex_count: usize,
-
-    /// Ordered list of named nested regexes in this regex scope.
-    regex_names: Vec<String>,
 }
+
+impl RegexMetadata {
+    /// True if the scope declares no capture locations at all.
+    fn is_empty(&self) -> bool {
+        self.unnamed_count == 0 && self.names.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pattern tree
+// ---------------------------------------------------------------------------
 
 /// A single item inside a set expression.
 #[derive(Debug, Clone)]
@@ -201,17 +355,20 @@ enum Pat {
     /// A list of alternative subpatterns.
     Alternatives(Vec<Pat>),
 
-    /// A capture group around another pattern.
+    /// A capture group. Its inner pattern is a scope of its own.
     Capture {
         slot: Slot,
         inner: Box<Pat>,
+        /// Describes the inner scope. A default placeholder until `build`
+        /// compiles the pattern and fills in the real value.
+        metadata: Arc<RegexMetadata>,
     },
 
-    /// An embedded, reusable regex.
+    /// An embedded, already compiled, reusable regex (a scope of its own).
     Regex {
-        slot: RegexSlot,
+        slot: Slot,
         inner: Box<Pat>,
-        metadata: RegexMetadata,
+        metadata: Arc<RegexMetadata>,
     },
 
     /// A quantified subpattern.
@@ -225,6 +382,9 @@ enum Pat {
 
 impl Pat {
     /// Attempts to run this pattern from position `i` in the input.
+    ///
+    /// Returns every way the pattern can match, in priority order, each with
+    /// the capture data collected so far for the *current* scope.
     fn run(&self, s: &[char], i: usize, data: MatchData) -> Matches {
         match self {
             Pat::Literal(l) if s[i..].starts_with(l) => {
@@ -263,15 +423,38 @@ impl Pat {
                 .flat_map(|item| item.run(s, i, data.clone()))
                 .collect(),
 
-            Pat::Capture { slot, inner } => inner
-                .run(s, i, data)
+            // The inner pattern runs against a fresh `MatchData`, which is what
+            // makes the capture a separate scope. The finished inner data is
+            // attached to a new occurrence appended to this scope's slot, so
+            // repeated captures accumulate instead of overwriting.
+            Pat::Capture {
+                slot,
+                inner,
+                metadata,
+            } => inner
+                .run(s, i, MatchData::default())
                 .into_iter()
-                .map(|(end, mut data)| {
-                    data.spans.insert(slot.clone(), (i, end));
+                .map(|(end, inner_data)| {
+                    let mut data = data.clone();
+
+                    data.slots
+                        .entry(slot.clone())
+                        .or_default()
+                        .push(Occurrence {
+                            span: (i, end),
+                            // Group only if the scope declares locations;
+                            // otherwise only the text is needed (Literal).
+                            scope: (!metadata.is_empty()).then(|| Scope {
+                                data: Box::new(inner_data),
+                                metadata: metadata.clone(),
+                            }),
+                        });
+
                     (end, data)
                 })
                 .collect(),
 
+            // Nested regexes behave like captures that are always groups.
             Pat::Regex {
                 slot,
                 inner,
@@ -282,13 +465,16 @@ impl Pat {
                 .map(|(end, inner_data)| {
                     let mut data = data.clone();
 
-                    data.regexes.insert(
-                        slot.clone(),
-                        NestedMatch {
-                            data: Box::new(inner_data),
-                            metadata: metadata.clone(),
-                        },
-                    );
+                    data.slots
+                        .entry(slot.clone())
+                        .or_default()
+                        .push(Occurrence {
+                            span: (i, end),
+                            scope: Some(Scope {
+                                data: Box::new(inner_data),
+                                metadata: metadata.clone(),
+                            }),
+                        });
 
                     (end, data)
                 })
@@ -305,6 +491,9 @@ impl Pat {
 
     /// Recursively evaluates a repeated pattern while handling greedy and lazy
     /// expansion rules.
+    ///
+    /// The capture data is threaded through every iteration, so occurrences of
+    /// captures inside the repeated pattern are appended in iteration order.
     fn repeat(
         &self,
         min: usize,
@@ -338,164 +527,131 @@ impl Pat {
         }
     }
 
-    /// Assigns capture and nested regex indexes to the current regex level.
+    /// Validates and numbers one scope.
     ///
-    /// Numbering is local to the current scope and does not descend into nested
-    /// regexes, because each nested regex has its own numbering space.
-    fn numbered(self, next: usize, next_regex: usize) -> (Pat, usize, usize) {
-        match self {
-            Pat::Sequence(items) => {
-                let (items, n, r) = Self::numbered_all(items, next, next_regex);
-                (Pat::Sequence(items), n, r)
-            }
+    /// Checks for duplicate names among the locations declared directly in
+    /// this scope, assigns indexes, and recursively compiles the scopes of
+    /// nested captures. Returns the compiled pattern together with the
+    /// metadata describing this scope.
+    fn compile_scope(self) -> Result<(Pat, RegexMetadata), Error> {
+        let names = self.scope_names();
+        let mut seen = HashSet::new();
 
-            Pat::Alternatives(items) => {
-                let (items, n, r) = Self::numbered_all(items, next, next_regex);
-                (Pat::Alternatives(items), n, r)
+        for name in &names {
+            if !seen.insert(name.as_str()) {
+                return Err(Error::DuplicateName(name.clone()));
             }
+        }
 
-            Pat::Capture {
-                slot: Slot::Name(name),
-                inner,
-            } => {
-                let (inner, n, r) = inner.numbered(next, next_regex);
-                (
-                    Pat::Capture {
-                        slot: Slot::Name(name),
-                        inner: Box::new(inner),
-                    },
-                    n,
-                    r,
-                )
-            }
+        let mut next = 0;
+        let pat = self.compile(&mut next)?;
 
-            Pat::Capture {
-                slot: Slot::Index(_),
-                inner,
-            } => {
-                let (inner, n, r) = inner.numbered(next + 1, next_regex);
-                (
-                    Pat::Capture {
-                        slot: Slot::Index(next),
-                        inner: Box::new(inner),
-                    },
-                    n,
-                    r,
-                )
+        Ok((
+            pat,
+            RegexMetadata {
+                unnamed_count: next,
+                names,
+            },
+        ))
+    }
+
+    /// Assigns indexes within the current scope.
+    ///
+    /// Unnamed captures and unnamed nested regexes draw from the same counter,
+    /// so they share one index space. Nested capture scopes restart their own
+    /// numbering; nested regexes are already compiled and are not descended
+    /// into.
+    fn compile(self, next: &mut usize) -> Result<Pat, Error> {
+        Ok(match self {
+            Pat::Sequence(items) => Pat::Sequence(Self::compile_all(items, next)?),
+            Pat::Alternatives(items) => Pat::Alternatives(Self::compile_all(items, next)?),
+
+            Pat::Capture { slot, inner, .. } => {
+                let slot = match slot {
+                    Slot::Index(_) => Slot::Index(take_index(next)),
+                    named => named,
+                };
+
+                let (inner, metadata) = (*inner).compile_scope()?;
+
+                Pat::Capture {
+                    slot,
+                    inner: Box::new(inner),
+                    metadata: Arc::new(metadata),
+                }
             }
 
             Pat::Regex {
-                slot: RegexSlot::Name(name),
+                slot,
                 inner,
                 metadata,
-            } => (
-                Pat::Regex {
-                    slot: RegexSlot::Name(name),
-                    inner,
-                    metadata,
+            } => Pat::Regex {
+                slot: match slot {
+                    Slot::Index(_) => Slot::Index(take_index(next)),
+                    named => named,
                 },
-                next,
-                next_regex,
-            ),
-
-            Pat::Regex {
-                slot: RegexSlot::Index(_),
                 inner,
                 metadata,
-            } => (
-                Pat::Regex {
-                    slot: RegexSlot::Index(next_regex),
-                    inner,
-                    metadata,
-                },
-                next,
-                next_regex + 1,
-            ),
+            },
 
             Pat::Repeat {
                 inner,
                 min,
                 max,
                 lazy,
-            } => {
-                let (inner, n, r) = inner.numbered(next, next_regex);
-                (
-                    Pat::Repeat {
-                        inner: Box::new(inner),
-                        min,
-                        max,
-                        lazy,
-                    },
-                    n,
-                    r,
-                )
-            }
+            } => Pat::Repeat {
+                inner: Box::new(inner.compile(next)?),
+                min,
+                max,
+                lazy,
+            },
 
-            other => (other, next, next_regex),
-        }
+            other => other,
+        })
     }
 
-    /// Numbers all patterns in a vector in order.
-    fn numbered_all(items: Vec<Pat>, next: usize, next_regex: usize) -> (Vec<Pat>, usize, usize) {
-        items
-            .into_iter()
-            .fold((vec![], next, next_regex), |(mut done, n, r), item| {
-                let (item, n, r) = item.numbered(n, r);
-                done.push(item);
-                (done, n, r)
-            })
+    /// Compiles every pattern in a vector, in order, sharing one counter.
+    fn compile_all(items: Vec<Pat>, next: &mut usize) -> Result<Vec<Pat>, Error> {
+        items.into_iter().map(|item| item.compile(next)).collect()
     }
 
-    /// Collects all named captures declared at the current regex level.
+    /// Collects the names declared directly in the current scope.
     ///
-    /// This intentionally excludes nested regex contents because nested regexes
-    /// keep separate capture namespaces.
-    fn capture_names(&self) -> Vec<String> {
+    /// Named captures and named nested regexes share one namespace. Contents
+    /// of captures and nested regexes are excluded because each opens its own
+    /// scope with its own namespace.
+    fn scope_names(&self) -> Vec<String> {
         match self {
             Pat::Sequence(items) | Pat::Alternatives(items) => {
-                items.iter().flat_map(Pat::capture_names).collect()
+                items.iter().flat_map(Pat::scope_names).collect()
             }
+
+            Pat::Repeat { inner, .. } => inner.scope_names(),
 
             Pat::Capture {
                 slot: Slot::Name(name),
-                inner,
-            } => std::iter::once(name.clone())
-                .chain(inner.capture_names())
-                .collect(),
-
-            Pat::Capture {
-                slot: Slot::Index(_),
-                inner,
-            } => inner.capture_names(),
-
-            Pat::Repeat { inner, .. } => inner.capture_names(),
-
-            Pat::Literal(_) | Pat::Set { .. } | Pat::Border { .. } | Pat::Regex { .. } => {
-                vec![]
+                ..
             }
-        }
-    }
-
-    /// Collects all named nested regexes declared at the current regex level.
-    fn regex_names(&self) -> Vec<String> {
-        match self {
-            Pat::Sequence(items) | Pat::Alternatives(items) => {
-                items.iter().flat_map(Pat::regex_names).collect()
-            }
-
-            Pat::Capture { inner, .. } | Pat::Repeat { inner, .. } => inner.regex_names(),
-
-            Pat::Regex {
-                slot: RegexSlot::Name(name),
+            | Pat::Regex {
+                slot: Slot::Name(name),
                 ..
             } => vec![name.clone()],
 
-            Pat::Literal(_) | Pat::Set { .. } | Pat::Border { .. } | Pat::Regex { .. } => {
-                vec![]
-            }
+            _ => vec![],
         }
     }
 }
+
+/// Returns the current index and advances the counter.
+fn take_index(next: &mut usize) -> usize {
+    let index = *next;
+    *next += 1;
+    index
+}
+
+// ---------------------------------------------------------------------------
+// Set and alternative builders
+// ---------------------------------------------------------------------------
 
 /// A builder for a character class.
 pub struct CharSet {
@@ -541,7 +697,9 @@ impl Alternatives {
     /// Adds a branch to the alternative list.
     ///
     /// The provided closure receives a fresh `RegexBuilder<AppendOnly>` so the
-    /// branch can be built independently.
+    /// branch can be built independently. Captures inside a branch belong to
+    /// the scope that contains the alternatives; a branch that is not taken
+    /// leaves its captures as empty vectors in the result.
     pub fn branch<T: State>(
         mut self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -552,6 +710,10 @@ impl Alternatives {
         self
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regex builder
+// ---------------------------------------------------------------------------
 
 /// A stateful builder for regex patterns.
 pub struct RegexBuilder<S: State> {
@@ -579,19 +741,21 @@ impl RegexBuilder<AppendOnly> {
 /// A fully compiled regex pattern with metadata.
 #[derive(Debug, Clone)]
 pub struct Regex {
-    /// The compiled pattern tree.
+    /// The compiled pattern tree, with all indexes assigned.
     pattern: Pat,
 
-    /// Metadata describing how capture and nested regex slots are numbered.
-    metadata: RegexMetadata,
+    /// Describes the capture locations of the top-level scope.
+    metadata: Arc<RegexMetadata>,
 }
 
 impl Regex {
     /// Attempts to match the entire input and returns the captures for the
     /// successful match.
     ///
-    /// The regex must consume the whole input string from start to finish. If it
-    /// does, the capture data is returned.
+    /// The regex must consume the whole input string from start to finish. If
+    /// it does, the hierarchical capture data is returned; otherwise `None`.
+    /// When several matches are possible, the first one in greedy/lazy
+    /// priority order wins.
     pub fn collect(&self, input: impl Into<String>) -> Option<Captures> {
         let chars: Vec<char> = input.into().chars().collect();
 
@@ -606,100 +770,45 @@ impl Regex {
     }
 }
 
-/// Builds a public `Captures` object from a match result and the regex metadata.
+/// Builds the public [`Captures`] for one scope.
+///
+/// Every location declared in `metadata` is materialized: locations that never
+/// matched become empty vectors, which is what distinguishes an untaken route
+/// from an occurrence that matched the empty string.
 fn make_captures(data: &MatchData, chars: &[char], metadata: &RegexMetadata) -> Captures {
-    let text = |slot: Slot| -> String {
-        data.spans
+    let occurrences = |slot: Slot| -> Vec<CaptureType> {
+        data.slots
             .get(&slot)
-            .map(|&(a, b)| chars[a..b].iter().collect())
+            .map(|list| list.iter().map(|o| make_occurrence(o, chars)).collect())
             .unwrap_or_default()
     };
 
-    let unnamed = (0..metadata.unnamed_count)
-        .map(|i| text(Slot::Index(i)))
-        .collect();
-
-    let named = metadata
-        .names
-        .iter()
-        .map(|name| (name.clone(), text(Slot::Name(name.clone()))))
-        .collect();
-
-    let unnamed_regexes = (0..metadata.unnamed_regex_count)
-        .map(|i| {
-            data.regexes
-                .get(&RegexSlot::Index(i))
-                .map(|nested| make_captures(&nested.data, chars, &nested.metadata))
-                .unwrap_or_else(|| empty_captures(&data.regexes, i))
-        })
-        .collect();
-
-    let named_regexes = metadata
-        .regex_names
-        .iter()
-        .filter_map(|name| {
-            data.regexes
-                .get(&RegexSlot::Name(name.clone()))
-                .map(|nested| {
-                    (
-                        name.clone(),
-                        make_captures(&nested.data, chars, &nested.metadata),
-                    )
-                })
-                .or_else(|| None)
-        })
-        .collect();
-
     Captures {
-        unnamed,
-        named,
-        unnamed_regexes,
-        named_regexes,
+        unnamed: (0..metadata.unnamed_count)
+            .map(|i| occurrences(Slot::Index(i)))
+            .collect(),
+        named: metadata
+            .names
+            .iter()
+            .map(|name| (name.clone(), occurrences(Slot::Name(name.clone()))))
+            .collect(),
     }
 }
 
-/// Produces empty capture values for nested regexes that did not participate in
-/// the final match.
-fn empty_captures(regexes: &HashMap<RegexSlot, NestedMatch>, index: usize) -> Captures {
-    match regexes.get(&RegexSlot::Index(index)) {
-        Some(nested) => {
-            let metadata = &nested.metadata;
-            Captures {
-                unnamed: vec![String::new(); metadata.unnamed_count],
-                named: metadata
-                    .names
-                    .iter()
-                    .map(|name| (name.clone(), String::new()))
-                    .collect(),
-                unnamed_regexes: (0..metadata.unnamed_regex_count)
-                    .map(|i| empty_captures(&nested.data.regexes, i))
-                    .collect(),
-                named_regexes: metadata
-                    .regex_names
-                    .iter()
-                    .map(|name| {
-                        let captures = nested
-                            .data
-                            .regexes
-                            .get(&RegexSlot::Name(name.clone()))
-                            .map(|n| make_captures(&n.data, &[], &n.metadata))
-                            .unwrap_or_else(|| Captures {
-                                unnamed: vec![],
-                                named: HashMap::new(),
-                                unnamed_regexes: vec![],
-                                named_regexes: HashMap::new(),
-                            });
-                        (name.clone(), captures)
-                    })
-                    .collect(),
-            }
-        }
-        None => Captures {
-            unnamed: vec![],
-            named: HashMap::new(),
-            unnamed_regexes: vec![],
-            named_regexes: HashMap::new(),
+/// Converts one recorded occurrence into its public form.
+///
+/// The text is sliced from the exact span the occurrence consumed, so `full()`
+/// is correct per occurrence and includes everything matched inside a group.
+fn make_occurrence(occurrence: &Occurrence, chars: &[char]) -> CaptureType {
+    let (start, end) = occurrence.span;
+    let full: String = chars[start..end].iter().collect();
+
+    match &occurrence.scope {
+        Some(scope) => CaptureType::Group {
+            full,
+            captures: make_captures(&scope.data, chars, &scope.metadata),
         },
+        None => CaptureType::Literal(full),
     }
 }
 
@@ -788,11 +897,12 @@ impl<S: State> RegexBuilder<S> {
 
     /// Appends a reusable regex without consuming it.
     ///
-    /// The nested regex keeps its own capture namespace and does not affect the
-    /// outer level's numbering.
+    /// The nested regex occupies the next free index in the current scope,
+    /// sharing the index space with ordinary captures. Its own captures stay
+    /// isolated inside its result and are reached through the occurrence.
     pub fn regex(self, regex: &Regex) -> RegexBuilder<Quantifiable> {
         self.push(Pat::Regex {
-            slot: RegexSlot::Index(0),
+            slot: Slot::Index(0), // placeholder, assigned in `build`
             inner: Box::new(regex.pattern.clone()),
             metadata: regex.metadata.clone(),
         })
@@ -804,7 +914,7 @@ impl<S: State> RegexBuilder<S> {
     /// with named captures and other named nested regexes.
     pub fn regex_named(self, name: impl Into<String>, regex: &Regex) -> RegexBuilder<Quantifiable> {
         self.push(Pat::Regex {
-            slot: RegexSlot::Name(name.into()),
+            slot: Slot::Name(name.into()),
             inner: Box::new(regex.pattern.clone()),
             metadata: regex.metadata.clone(),
         })
@@ -831,6 +941,8 @@ impl<S: State> RegexBuilder<S> {
     }
 
     /// Creates a subpattern group without introducing a capture.
+    ///
+    /// Captures declared inside belong to the enclosing scope.
     pub fn group<T: State>(
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -839,17 +951,25 @@ impl<S: State> RegexBuilder<S> {
     }
 
     /// Creates an unnamed capture group.
+    ///
+    /// The capture takes the next free index in the current scope. Everything
+    /// declared inside the closure forms a nested scope with its own indexes
+    /// and names. Repeating the capture records one occurrence per iteration.
     pub fn capture<T: State>(
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
     ) -> RegexBuilder<Quantifiable> {
         self.nest(build, |inner| Pat::Capture {
-            slot: Slot::Index(0),
+            slot: Slot::Index(0), // placeholder, assigned in `build`
             inner: Box::new(inner),
+            metadata: Arc::default(), // placeholder, filled in `build`
         })
     }
 
     /// Creates a named capture group.
+    ///
+    /// Behaves like [`RegexBuilder::capture`], but the location is addressed by
+    /// name in the shared name namespace of the current scope.
     pub fn capture_named<T: State>(
         self,
         name: impl Into<String>,
@@ -860,6 +980,7 @@ impl<S: State> RegexBuilder<S> {
         self.nest(build, move |inner| Pat::Capture {
             slot: Slot::Name(name),
             inner: Box::new(inner),
+            metadata: Arc::default(), // placeholder, filled in `build`
         })
     }
 
@@ -880,35 +1001,19 @@ impl<S: State> RegexBuilder<S> {
 
     /// Finalizes the builder and turns it into a compiled regex.
     ///
-    /// This step validates duplicate names and errors encountered while building
-    /// the pattern, then assigns indices for all captures and nested regexes.
+    /// Reports any error recorded while building, then validates duplicate
+    /// names and assigns indexes scope by scope: the top level first, then each
+    /// capture group's inner scope independently.
     pub fn build(self) -> Result<Regex, Error> {
         if let Some(error) = self.error {
             return Err(error);
         }
 
-        let pattern = Pat::Sequence(self.nodes);
-        let names = pattern.capture_names();
-        let regex_names = pattern.regex_names();
-
-        let mut seen = HashSet::new();
-
-        for name in names.iter().chain(regex_names.iter()) {
-            if !seen.insert(name.as_str()) {
-                return Err(Error::DuplicateName(name.clone()));
-            }
-        }
-
-        let (pattern, unnamed_count, unnamed_regex_count) = pattern.numbered(0, 0);
+        let (pattern, metadata) = Pat::Sequence(self.nodes).compile_scope()?;
 
         Ok(Regex {
             pattern,
-            metadata: RegexMetadata {
-                unnamed_count,
-                names,
-                unnamed_regex_count,
-                regex_names,
-            },
+            metadata: Arc::new(metadata),
         })
     }
 }
