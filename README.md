@@ -6,7 +6,7 @@ A Rust library for constructing regular expressions with an explicit builder API
 
 Regex Builder is designed for structured pattern construction. Instead of writing a raw pattern string, you build the expression using Rust methods. This makes it easier to wire together complex patterns, keep capture names organized, and validate the pattern as it is assembled.
 
-The main entry point is:
+The primary entry point is:
 
 ```rust
 use regex_builder::RegexBuilder;
@@ -197,10 +197,12 @@ Use border checks to match word-like transitions:
 ```rust
 let regex = RegexBuilder::new()
     .word_border()
+    .literal("cat")
     .build()
     .unwrap();
 
-assert!(regex.collect("").is_some());
+assert!(regex.collect("cat").is_some());
+assert!(regex.collect("dog").is_none());
 ```
 
 The library also provides:
@@ -400,6 +402,8 @@ let regex = RegexBuilder::new()
     .lazy()
     .build()
     .unwrap();
+
+assert!(regex.collect("aaa").is_some());
 ```
 
 The lazy flag affects the repetition strategy for the last quantified atom.
