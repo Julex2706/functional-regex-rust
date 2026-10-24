@@ -46,6 +46,9 @@ pub enum Error {
 
     /// Signals that a character range had its start after its end.
     InvalidRange { from: char, to: char },
+
+    /// Signals that an alternative expression (`or` / `any_of`) has no branches.
+    EmptyAlternative,
 }
 
 impl fmt::Display for Error {
@@ -62,6 +65,9 @@ impl fmt::Display for Error {
             }
             Error::InvalidRange { from, to } => {
                 write!(f, "range start '{from}' comes after its end '{to}'")
+            }
+            Error::EmptyAlternative => {
+                write!(f, "alternative expression has no branches")
             }
         }
     }
@@ -945,8 +951,15 @@ impl<S: State> RegexBuilder<S> {
             error: None,
         });
 
+        let empty = alternatives.branches.is_empty();
+
         let mut next = self.push(Pat::Alternatives(alternatives.branches));
         next.record(alternatives.error);
+
+        if empty {
+            next.record(Some(Error::EmptyAlternative));
+        }
+
         next
     }
 
