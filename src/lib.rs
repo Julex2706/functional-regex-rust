@@ -2,43 +2,40 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::marker::PhantomData;
 
-// ---------- States ----------
-//
-//  RegexBuilder::new() ─────────────────────────────► AppendOnly
-//  any state + literal / any_char_of / any_except /
-//              group / capture / capture_named / or ► Quantifiable
-//  any state + border_of / non_border_of ──────────► AppendOnly
-//  Quantifiable + quantify(min, max) ─────────────► QuantifiedGreedy
-//  QuantifiedGreedy + lazy() ─────────────────────► AppendOnly
-//  any state + build() ─────────────────────────────► Regex (separate type, see below)
-//
-//  (All helpers at the bottom are built from these and follow the same transitions.)
-
+/// A regex construction state marker.
+///
+/// The builder moves through a small state machine:
+/// - `AppendOnly`: new atoms can be appended, but no quantifier may be applied yet.
+/// - `Quantifiable`: the most recently added atom is eligible to be quantified.
+/// - `QuantifiedGreedy`: the last atom has been quantified and can still be made lazy.
 pub trait State {}
 
-/// Nothing to quantify: empty, after a border, or the last quantifier was made lazy.
+/// Marks the start of a regex builder. New atoms can be appended, but the
+/// pattern cannot yet be quantified.
 pub struct AppendOnly;
-/// The last expression is plain: it can be quantified.
+
+/// Marks a pattern segment that is ready to receive a quantifier.
 pub struct Quantifiable;
-/// The last expression has a greedy quantifier: it can become lazy.
+
+/// Marks a quantified segment that may still be converted to a lazy form.
 pub struct QuantifiedGreedy;
 
 impl State for AppendOnly {}
 impl State for Quantifiable {}
 impl State for QuantifiedGreedy {}
 
-// ---------- Errors ----------
-
-/// Everything that can go wrong.
-/// `build` reports mistakes in the pattern (if there are several, the first one
-/// made, in call order).
+/// Errors produced while constructing or validating a regular expression.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
-    /// The same capture name is used by more than one `capture_named`.
+    /// Signals that the same capture or regex name was used more than once in
+    /// the same regex scope.
     DuplicateName(String),
-    /// `quantify(min, max)` with min > max.
+
+    /// Signals that a quantifier was built with a minimum greater than the
+    /// maximum.
     InvalidQuantifier { min: usize, max: usize },
-    /// `range(from, to)` with from > to.
+
+    /// Signals that a character range had its start after its end.
     InvalidRange { from: char, to: char },
 }
 
@@ -46,7 +43,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::DuplicateName(name) => {
-                write!(f, "capture name '{name}' is used more than once")
+                write!(f, "capture or regex name '{name}' is used more than once")
             }
             Error::InvalidQuantifier { min, max } => {
                 write!(
@@ -63,52 +60,115 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-// ---------- Result type ----------
-
-/// What `collect` returns.
-/// Unnamed captures are indexed in order. Named captures take no index.
-/// A capture inside a repetition keeps its LAST value (like Ruby).
-/// A capture that did not take part in the match is "".
+/// A single set of capture results produced by a successful match.
+///
+/// The structure is scoped to one regex level. Unnamed captures and unnamed
+/// nested regexes each have their own zero-based index order. Named captures and
+/// named nested regexes share the same name namespace at that level.
 #[derive(Debug, PartialEq)]
 pub struct Captures {
     unnamed: Vec<String>,
     named: HashMap<String, String>,
+    unnamed_regexes: Vec<Captures>,
+    named_regexes: HashMap<String, Captures>,
 }
 
 impl Captures {
-    /// The n-th unnamed capture (0-based).
+    /// Returns the value of the nth unnamed capture, counting from zero.
     pub fn get(&self, index: usize) -> Option<&str> {
         self.unnamed.get(index).map(String::as_str)
     }
 
-    /// The capture with this name.
-    pub fn named(&self, name: impl Into<String>) -> Option<&str> {
-        self.named.get(&name.into()).map(String::as_str)
+    /// Returns the value associated with a named capture.
+    pub fn named(&self, name: impl AsRef<str>) -> Option<&str> {
+        self.named.get(name.as_ref()).map(String::as_str)
+    }
+
+    /// Returns the captures produced by the nth unnamed nested regex.
+    pub fn get_regex(&self, index: usize) -> Option<&Captures> {
+        self.unnamed_regexes.get(index)
+    }
+
+    /// Returns the captures produced by a named nested regex.
+    pub fn named_regex(&self, name: impl AsRef<str>) -> Option<&Captures> {
+        self.named_regexes.get(name.as_ref())
     }
 }
 
-// ---------- Pattern tree (private) ----------
-
-/// Where a capture is stored: unnamed ones by index, named ones by name.
+/// A slot used to store a capture span in a single regex scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Slot {
+    /// A capture identified by its zero-based index.
     Index(usize),
+
+    /// A capture identified by a user-defined name.
     Name(String),
 }
 
-/// Captured spans of one match path. Inserting overrides, so the last capture wins.
-type Spans = HashMap<Slot, (usize, usize)>;
-/// Every way a pattern can match from a position, best first:
-/// (end position, capture spans so far).
-type Matches = Vec<(usize, Spans)>;
+/// A slot used to store nested regex match data in a single regex scope.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RegexSlot {
+    /// A nested regex identified by its zero-based index.
+    Index(usize),
 
-#[derive(Debug)]
+    /// A nested regex identified by a user-defined name.
+    Name(String),
+}
+
+/// A map of capture spans keyed by slot.
+type Spans = HashMap<Slot, (usize, usize)>;
+
+/// A sequence of possible match states for a pattern.
+type Matches = Vec<(usize, MatchData)>;
+
+/// Match data collected while evaluating a regex pattern.
+#[derive(Debug, Clone, Default)]
+struct MatchData {
+    /// Spans captured by the current regex level.
+    spans: Spans,
+
+    /// Nested regexes captured by the current regex level.
+    regexes: HashMap<RegexSlot, NestedMatch>,
+}
+
+/// A nested regex match with its metadata.
+#[derive(Debug, Clone)]
+struct NestedMatch {
+    /// The captured data for the nested regex match.
+    data: Box<MatchData>,
+
+    /// The metadata describing the nested regex capture structure.
+    metadata: RegexMetadata,
+}
+
+/// Static metadata describing the captures and nested regex names for one level.
+#[derive(Debug, Clone)]
+struct RegexMetadata {
+    /// Number of unnamed captures in this regex scope.
+    unnamed_count: usize,
+
+    /// Ordered list of named captures in this regex scope.
+    names: Vec<String>,
+
+    /// Number of unnamed nested regexes in this regex scope.
+    unnamed_regex_count: usize,
+
+    /// Ordered list of named nested regexes in this regex scope.
+    regex_names: Vec<String>,
+}
+
+/// A single item inside a set expression.
+#[derive(Debug, Clone)]
 enum SetItem {
+    /// A literal set of characters.
     Chars(Vec<char>),
-    Range(char, char), // inclusive, from <= to
+
+    /// A character range.
+    Range(char, char),
 }
 
 impl SetItem {
+    /// Returns true if the given character belongs to this set item.
     fn contains(&self, c: char) -> bool {
         match self {
             SetItem::Chars(chars) => chars.contains(&c),
@@ -117,27 +177,44 @@ impl SetItem {
     }
 }
 
-#[derive(Debug)]
+/// Pattern nodes used to build a regex.
+#[derive(Debug, Clone)]
 enum Pat {
+    /// A literal string pattern.
     Literal(Vec<char>),
+
+    /// A set or negated set matcher.
     Set {
         items: Vec<SetItem>,
         negated: bool,
     },
-    /// Zero-width. Border (\b): exactly one side of the position is in the set.
-    /// Non-border (\B, `negated`): both sides or neither side are in the set.
-    /// The start and end of the input count as "not in the set".
+
+    /// A border matcher such as word boundary style checks.
     Border {
         items: Vec<SetItem>,
         negated: bool,
     },
+
+    /// A concatenation of multiple subpatterns.
     Sequence(Vec<Pat>),
+
+    /// A list of alternative subpatterns.
     Alternatives(Vec<Pat>),
-    /// Unnamed captures get their real index in `numbered`.
+
+    /// A capture group around another pattern.
     Capture {
         slot: Slot,
         inner: Box<Pat>,
     },
+
+    /// An embedded, reusable regex.
+    Regex {
+        slot: RegexSlot,
+        inner: Box<Pat>,
+        metadata: RegexMetadata,
+    },
+
+    /// A quantified subpattern.
     Repeat {
         inner: Box<Pat>,
         min: usize,
@@ -147,54 +224,87 @@ enum Pat {
 }
 
 impl Pat {
-    fn run(&self, s: &[char], i: usize, spans: Spans) -> Matches {
+    /// Attempts to run this pattern from position `i` in the input.
+    fn run(&self, s: &[char], i: usize, data: MatchData) -> Matches {
         match self {
-            Pat::Literal(l) if s[i..].starts_with(l) => vec![(i + l.len(), spans)],
+            Pat::Literal(l) if s[i..].starts_with(l) => {
+                vec![(i + l.len(), data)]
+            }
             Pat::Literal(_) => vec![],
+
             Pat::Set { items, negated } => match s.get(i) {
                 Some(c) if items.iter().any(|item| item.contains(*c)) != *negated => {
-                    vec![(i + 1, spans)]
+                    vec![(i + 1, data)]
                 }
                 _ => vec![],
             },
+
             Pat::Border { items, negated } => {
                 let inside = |c: &char| items.iter().any(|item| item.contains(*c));
                 let before = i.checked_sub(1).map_or(false, |p| inside(&s[p]));
                 let after = s.get(i).map_or(false, inside);
+
                 if (before != after) != *negated {
-                    vec![(i, spans)]
+                    vec![(i, data)]
                 } else {
                     vec![]
                 }
             }
-            Pat::Sequence(items) => items.iter().fold(vec![(i, spans)], |states, item| {
+
+            Pat::Sequence(items) => items.iter().fold(vec![(i, data)], |states, item| {
                 states
                     .into_iter()
-                    .flat_map(|(i, spans)| item.run(s, i, spans))
+                    .flat_map(|(position, data)| item.run(s, position, data))
                     .collect()
             }),
+
             Pat::Alternatives(items) => items
                 .iter()
-                .flat_map(|item| item.run(s, i, spans.clone()))
+                .flat_map(|item| item.run(s, i, data.clone()))
                 .collect(),
+
             Pat::Capture { slot, inner } => inner
-                .run(s, i, spans)
+                .run(s, i, data)
                 .into_iter()
-                .map(|(end, mut spans)| {
-                    spans.insert(slot.clone(), (i, end)); // overrides an earlier value
-                    (end, spans)
+                .map(|(end, mut data)| {
+                    data.spans.insert(slot.clone(), (i, end));
+                    (end, data)
                 })
                 .collect(),
+
+            Pat::Regex {
+                slot,
+                inner,
+                metadata,
+            } => inner
+                .run(s, i, MatchData::default())
+                .into_iter()
+                .map(|(end, inner_data)| {
+                    let mut data = data.clone();
+
+                    data.regexes.insert(
+                        slot.clone(),
+                        NestedMatch {
+                            data: Box::new(inner_data),
+                            metadata: metadata.clone(),
+                        },
+                    );
+
+                    (end, data)
+                })
+                .collect(),
+
             Pat::Repeat {
                 inner,
                 min,
                 max,
                 lazy,
-            } => inner.repeat(*min, *max, *lazy, s, i, spans, 0),
+            } => inner.repeat(*min, *max, *lazy, s, i, data, 0),
         }
     }
 
-    /// Match `self` repeatedly. `done` = repetitions so far.
+    /// Recursively evaluates a repeated pattern while handling greedy and lazy
+    /// expansion rules.
     fn repeat(
         &self,
         min: usize,
@@ -202,23 +312,25 @@ impl Pat {
         lazy: bool,
         s: &[char],
         i: usize,
-        spans: Spans,
+        data: MatchData,
         done: usize,
     ) -> Matches {
         let stop_here: Matches = if done >= min {
-            vec![(i, spans.clone())]
+            vec![(i, data.clone())]
         } else {
             vec![]
         };
+
         let keep_going: Matches = if max.map_or(true, |m| done < m) {
-            self.run(s, i, spans)
+            self.run(s, i, data)
                 .into_iter()
-                .filter(|(end, _)| !(*end == i && done >= min)) // no empty loops
-                .flat_map(|(end, spans)| self.repeat(min, max, lazy, s, end, spans, done + 1))
+                .filter(|(end, _)| !(*end == i && done >= min))
+                .flat_map(|(end, data)| self.repeat(min, max, lazy, s, end, data, done + 1))
                 .collect()
         } else {
             vec![]
         };
+
         if lazy {
             [stop_here, keep_going].concat()
         } else {
@@ -226,51 +338,87 @@ impl Pat {
         }
     }
 
-    /// Give each UNNAMED capture its index by opening order.
-    /// Named captures take no index. Returns the next free index.
-    fn numbered(self, next: usize) -> (Pat, usize) {
+    /// Assigns capture and nested regex indexes to the current regex level.
+    ///
+    /// Numbering is local to the current scope and does not descend into nested
+    /// regexes, because each nested regex has its own numbering space.
+    fn numbered(self, next: usize, next_regex: usize) -> (Pat, usize, usize) {
         match self {
             Pat::Sequence(items) => {
-                let (items, after) = Pat::numbered_all(items, next);
-                (Pat::Sequence(items), after)
+                let (items, n, r) = Self::numbered_all(items, next, next_regex);
+                (Pat::Sequence(items), n, r)
             }
+
             Pat::Alternatives(items) => {
-                let (items, after) = Pat::numbered_all(items, next);
-                (Pat::Alternatives(items), after)
+                let (items, n, r) = Self::numbered_all(items, next, next_regex);
+                (Pat::Alternatives(items), n, r)
             }
+
             Pat::Capture {
-                slot: named @ Slot::Name(_),
+                slot: Slot::Name(name),
                 inner,
             } => {
-                let (inner, after) = (*inner).numbered(next);
+                let (inner, n, r) = inner.numbered(next, next_regex);
                 (
                     Pat::Capture {
-                        slot: named,
+                        slot: Slot::Name(name),
                         inner: Box::new(inner),
                     },
-                    after,
+                    n,
+                    r,
                 )
             }
+
             Pat::Capture {
                 slot: Slot::Index(_),
                 inner,
             } => {
-                let (inner, after) = (*inner).numbered(next + 1);
+                let (inner, n, r) = inner.numbered(next + 1, next_regex);
                 (
                     Pat::Capture {
                         slot: Slot::Index(next),
                         inner: Box::new(inner),
                     },
-                    after,
+                    n,
+                    r,
                 )
             }
+
+            Pat::Regex {
+                slot: RegexSlot::Name(name),
+                inner,
+                metadata,
+            } => (
+                Pat::Regex {
+                    slot: RegexSlot::Name(name),
+                    inner,
+                    metadata,
+                },
+                next,
+                next_regex,
+            ),
+
+            Pat::Regex {
+                slot: RegexSlot::Index(_),
+                inner,
+                metadata,
+            } => (
+                Pat::Regex {
+                    slot: RegexSlot::Index(next_regex),
+                    inner,
+                    metadata,
+                },
+                next,
+                next_regex + 1,
+            ),
+
             Pat::Repeat {
                 inner,
                 min,
                 max,
                 lazy,
             } => {
-                let (inner, after) = (*inner).numbered(next);
+                let (inner, n, r) = inner.numbered(next, next_regex);
                 (
                     Pat::Repeat {
                         inner: Box::new(inner),
@@ -278,63 +426,98 @@ impl Pat {
                         max,
                         lazy,
                     },
-                    after,
+                    n,
+                    r,
                 )
             }
-            other => (other, next),
+
+            other => (other, next, next_regex),
         }
     }
 
-    fn numbered_all(items: Vec<Pat>, next: usize) -> (Vec<Pat>, usize) {
+    /// Numbers all patterns in a vector in order.
+    fn numbered_all(items: Vec<Pat>, next: usize, next_regex: usize) -> (Vec<Pat>, usize, usize) {
         items
             .into_iter()
-            .fold((vec![], next), |(mut done, n), item| {
-                let (item, n) = item.numbered(n);
+            .fold((vec![], next, next_regex), |(mut done, n, r), item| {
+                let (item, n, r) = item.numbered(n, r);
                 done.push(item);
-                (done, n)
+                (done, n, r)
             })
     }
 
-    /// Every capture name in the pattern, in opening order (duplicates included).
+    /// Collects all named captures declared at the current regex level.
+    ///
+    /// This intentionally excludes nested regex contents because nested regexes
+    /// keep separate capture namespaces.
     fn capture_names(&self) -> Vec<String> {
         match self {
             Pat::Sequence(items) | Pat::Alternatives(items) => {
                 items.iter().flat_map(Pat::capture_names).collect()
             }
+
             Pat::Capture {
                 slot: Slot::Name(name),
                 inner,
             } => std::iter::once(name.clone())
                 .chain(inner.capture_names())
                 .collect(),
+
             Pat::Capture {
                 slot: Slot::Index(_),
                 inner,
             } => inner.capture_names(),
+
             Pat::Repeat { inner, .. } => inner.capture_names(),
-            Pat::Literal(_) | Pat::Set { .. } | Pat::Border { .. } => vec![],
+
+            Pat::Literal(_) | Pat::Set { .. } | Pat::Border { .. } | Pat::Regex { .. } => {
+                vec![]
+            }
+        }
+    }
+
+    /// Collects all named nested regexes declared at the current regex level.
+    fn regex_names(&self) -> Vec<String> {
+        match self {
+            Pat::Sequence(items) | Pat::Alternatives(items) => {
+                items.iter().flat_map(Pat::regex_names).collect()
+            }
+
+            Pat::Capture { inner, .. } | Pat::Repeat { inner, .. } => inner.regex_names(),
+
+            Pat::Regex {
+                slot: RegexSlot::Name(name),
+                ..
+            } => vec![name.clone()],
+
+            Pat::Literal(_) | Pat::Set { .. } | Pat::Border { .. } | Pat::Regex { .. } => {
+                vec![]
+            }
         }
     }
 }
 
-// ---------- Character set builder (for any_char_of / any_except / borders) ----------
-
-/// The members of a character set. A character matches if it is in ANY of the items.
+/// A builder for a character class.
 pub struct CharSet {
+    /// The raw character items in the set.
     items: Vec<SetItem>,
+
+    /// The first error produced while building the character class.
     error: Option<Error>,
 }
 
 impl CharSet {
-    /// Add every character of `chars` as a member.
+    /// Adds a literal string to the current set.
     pub fn literal(mut self, chars: impl Into<String>) -> CharSet {
         self.items
             .push(SetItem::Chars(chars.into().chars().collect()));
         self
     }
 
-    /// Add every character from `from` to `to`, both included.
-    /// from > to is an `Error::InvalidRange`, reported by `build`.
+    /// Adds a range to the current set.
+    ///
+    /// If `from > to`, the builder records an invalid range error instead of
+    /// silently producing nonsense.
     pub fn range(mut self, from: char, to: char) -> CharSet {
         if from > to {
             self.error = self.error.or(Some(Error::InvalidRange { from, to }));
@@ -345,15 +528,20 @@ impl CharSet {
     }
 }
 
-// ---------- Alternatives builder (for `or`) ----------
-
+/// A builder for a sequence of alternative branches.
 pub struct Alternatives {
+    /// The branches in the alternative expression.
     branches: Vec<Pat>,
+
+    /// The first error encountered in any branch.
     error: Option<Error>,
 }
 
 impl Alternatives {
-    /// Add one alternative.
+    /// Adds a branch to the alternative list.
+    ///
+    /// The provided closure receives a fresh `RegexBuilder<AppendOnly>` so the
+    /// branch can be built independently.
     pub fn branch<T: State>(
         mut self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -365,17 +553,20 @@ impl Alternatives {
     }
 }
 
-// ---------- Builder ----------
-
-/// A pattern under construction. It knows nothing about any input.
-/// Call `build` to finish it, then `collect` on the result as often as you like.
+/// A stateful builder for regex patterns.
 pub struct RegexBuilder<S: State> {
+    /// The sequence of compiled pattern nodes currently assembled.
     nodes: Vec<Pat>,
-    error: Option<Error>, // first mistake made while building
+
+    /// The first validation error encountered while building.
+    error: Option<Error>,
+
+    /// Phantom state marker used to enforce the builder state machine.
     _state: PhantomData<fn() -> S>,
 }
 
 impl RegexBuilder<AppendOnly> {
+    /// Creates a new regex builder in the append-only state.
     pub fn new() -> RegexBuilder<AppendOnly> {
         RegexBuilder {
             nodes: vec![],
@@ -385,52 +576,136 @@ impl RegexBuilder<AppendOnly> {
     }
 }
 
-// ---------- Finished pattern ----------
-
-/// A checked, finished pattern. A separate type, so none of the builder methods
-/// exist on it. It never changes, so `collect` only needs `&self`:
-/// build once, collect as many inputs as you want.
-#[derive(Debug)]
+/// A fully compiled regex pattern with metadata.
+#[derive(Debug, Clone)]
 pub struct Regex {
+    /// The compiled pattern tree.
     pattern: Pat,
-    unnamed_count: usize,
-    names: Vec<String>,
+
+    /// Metadata describing how capture and nested regex slots are numbered.
+    metadata: RegexMetadata,
 }
 
 impl Regex {
-    /// The whole input must match.
-    /// Returns the captures if the pattern matches all of the input.
+    /// Attempts to match the entire input and returns the captures for the
+    /// successful match.
+    ///
+    /// The regex must consume the whole input string from start to finish. If it
+    /// does, the capture data is returned.
     pub fn collect(&self, input: impl Into<String>) -> Option<Captures> {
         let chars: Vec<char> = input.into().chars().collect();
-        let spans = self
+
+        let data = self
             .pattern
-            .run(&chars, 0, Spans::new())
+            .run(&chars, 0, MatchData::default())
             .into_iter()
             .find(|(end, _)| *end == chars.len())
-            .map(|(_, spans)| spans)?;
+            .map(|(_, data)| data)?;
 
-        let text = |slot: Slot| -> String {
-            spans
-                .get(&slot)
-                .map(|&(a, b)| chars[a..b].iter().collect())
-                .unwrap_or_default()
-        };
-        Some(Captures {
-            unnamed: (0..self.unnamed_count)
-                .map(|i| text(Slot::Index(i)))
-                .collect(),
-            named: self
-                .names
-                .iter()
-                .map(|name| (name.clone(), text(Slot::Name(name.clone()))))
-                .collect(),
-        })
+        Some(make_captures(&data, &chars, &self.metadata))
     }
 }
 
-// ===== Core: available in every state =====
+/// Builds a public `Captures` object from a match result and the regex metadata.
+fn make_captures(data: &MatchData, chars: &[char], metadata: &RegexMetadata) -> Captures {
+    let text = |slot: Slot| -> String {
+        data.spans
+            .get(&slot)
+            .map(|&(a, b)| chars[a..b].iter().collect())
+            .unwrap_or_default()
+    };
+
+    let unnamed = (0..metadata.unnamed_count)
+        .map(|i| text(Slot::Index(i)))
+        .collect();
+
+    let named = metadata
+        .names
+        .iter()
+        .map(|name| (name.clone(), text(Slot::Name(name.clone()))))
+        .collect();
+
+    let unnamed_regexes = (0..metadata.unnamed_regex_count)
+        .map(|i| {
+            data.regexes
+                .get(&RegexSlot::Index(i))
+                .map(|nested| make_captures(&nested.data, chars, &nested.metadata))
+                .unwrap_or_else(|| empty_captures(&data.regexes, i))
+        })
+        .collect();
+
+    let named_regexes = metadata
+        .regex_names
+        .iter()
+        .filter_map(|name| {
+            data.regexes
+                .get(&RegexSlot::Name(name.clone()))
+                .map(|nested| {
+                    (
+                        name.clone(),
+                        make_captures(&nested.data, chars, &nested.metadata),
+                    )
+                })
+                .or_else(|| None)
+        })
+        .collect();
+
+    Captures {
+        unnamed,
+        named,
+        unnamed_regexes,
+        named_regexes,
+    }
+}
+
+/// Produces empty capture values for nested regexes that did not participate in
+/// the final match.
+fn empty_captures(regexes: &HashMap<RegexSlot, NestedMatch>, index: usize) -> Captures {
+    match regexes.get(&RegexSlot::Index(index)) {
+        Some(nested) => {
+            let metadata = &nested.metadata;
+            Captures {
+                unnamed: vec![String::new(); metadata.unnamed_count],
+                named: metadata
+                    .names
+                    .iter()
+                    .map(|name| (name.clone(), String::new()))
+                    .collect(),
+                unnamed_regexes: (0..metadata.unnamed_regex_count)
+                    .map(|i| empty_captures(&nested.data.regexes, i))
+                    .collect(),
+                named_regexes: metadata
+                    .regex_names
+                    .iter()
+                    .map(|name| {
+                        let captures = nested
+                            .data
+                            .regexes
+                            .get(&RegexSlot::Name(name.clone()))
+                            .map(|n| make_captures(&n.data, &[], &n.metadata))
+                            .unwrap_or_else(|| Captures {
+                                unnamed: vec![],
+                                named: HashMap::new(),
+                                unnamed_regexes: vec![],
+                                named_regexes: HashMap::new(),
+                            });
+                        (name.clone(), captures)
+                    })
+                    .collect(),
+            }
+        }
+        None => Captures {
+            unnamed: vec![],
+            named: HashMap::new(),
+            unnamed_regexes: vec![],
+            named_regexes: HashMap::new(),
+        },
+    }
+}
 
 impl<S: State> RegexBuilder<S> {
+    /// Converts the current builder into a different state type while preserving
+    /// all assembled nodes and validation state.
     fn into_state<T: State>(self) -> RegexBuilder<T> {
         RegexBuilder {
             nodes: self.nodes,
@@ -439,17 +714,20 @@ impl<S: State> RegexBuilder<S> {
         }
     }
 
-    /// Remember a mistake. The first one stays.
+    /// Stores the first error encountered while building the regex.
     fn record(&mut self, error: Option<Error>) {
         self.error = self.error.take().or(error);
     }
 
+    /// Adds a pattern node and advances the builder into the quantifiable state.
     fn push(self, pat: Pat) -> RegexBuilder<Quantifiable> {
         let mut next = self.into_state::<Quantifiable>();
         next.nodes.push(pat);
         next
     }
 
+    /// Builds a nested pattern, preserving the outer builder state while wrapping
+    /// the inner result in a given pattern structure.
     fn nest<T: State>(
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -461,6 +739,7 @@ impl<S: State> RegexBuilder<S> {
         next
     }
 
+    /// Builds a character-set based pattern and tracks any validation error.
     fn set(
         self,
         build: impl FnOnce(CharSet) -> CharSet,
@@ -470,15 +749,17 @@ impl<S: State> RegexBuilder<S> {
             items: vec![],
             error: None,
         });
+
         let mut next = self.push(Pat::Set {
             items: set.items,
             negated,
         });
+
         next.record(set.error);
         next
     }
 
-    /// Borders are zero-width, so there is nothing to quantify afterwards.
+    /// Builds a border pattern and converts the builder back to append-only mode.
     fn border(
         self,
         build: impl FnOnce(CharSet) -> CharSet,
@@ -488,43 +769,68 @@ impl<S: State> RegexBuilder<S> {
             items: vec![],
             error: None,
         });
+
         let mut next = self
             .push(Pat::Border {
                 items: set.items,
                 negated,
             })
             .into_state::<AppendOnly>();
+
         next.record(set.error);
         next
     }
 
+    /// Adds a literal text atom to the pattern.
     pub fn literal(self, text: impl Into<String>) -> RegexBuilder<Quantifiable> {
         self.push(Pat::Literal(text.into().chars().collect()))
     }
 
-    /// One character that is in the set: [...]
+    /// Appends a reusable regex without consuming it.
+    ///
+    /// The nested regex keeps its own capture namespace and does not affect the
+    /// outer level's numbering.
+    pub fn regex(self, regex: &Regex) -> RegexBuilder<Quantifiable> {
+        self.push(Pat::Regex {
+            slot: RegexSlot::Index(0),
+            inner: Box::new(regex.pattern.clone()),
+            metadata: regex.metadata.clone(),
+        })
+    }
+
+    /// Appends a reusable regex under a name.
+    ///
+    /// The name is registered in the current scope's name namespace together
+    /// with named captures and other named nested regexes.
+    pub fn regex_named(self, name: impl Into<String>, regex: &Regex) -> RegexBuilder<Quantifiable> {
+        self.push(Pat::Regex {
+            slot: RegexSlot::Name(name.into()),
+            inner: Box::new(regex.pattern.clone()),
+            metadata: regex.metadata.clone(),
+        })
+    }
+
+    /// Matches any one character in the set produced by the closure.
     pub fn any_char_of(self, build: impl FnOnce(CharSet) -> CharSet) -> RegexBuilder<Quantifiable> {
         self.set(build, false)
     }
 
-    /// One character that is NOT in the set: [^...]
-    /// (`any_except(|s| s)` = any single character)
+    /// Matches any one character not in the set produced by the closure.
     pub fn any_except(self, build: impl FnOnce(CharSet) -> CharSet) -> RegexBuilder<Quantifiable> {
         self.set(build, true)
     }
 
-    /// A position where exactly one side is in the set: \b for the word set.
-    /// Zero-width. The start and end of the input count as "not in the set".
+    /// Matches a border around characters in the set produced by the closure.
     pub fn border_of(self, build: impl FnOnce(CharSet) -> CharSet) -> RegexBuilder<AppendOnly> {
         self.border(build, false)
     }
 
-    /// A position where both sides or neither side are in the set: \B for the word set.
+    /// Matches a non-border position relative to the set produced by the closure.
     pub fn non_border_of(self, build: impl FnOnce(CharSet) -> CharSet) -> RegexBuilder<AppendOnly> {
         self.border(build, true)
     }
 
-    /// (?:...)
+    /// Creates a subpattern group without introducing a capture.
     pub fn group<T: State>(
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -532,7 +838,7 @@ impl<S: State> RegexBuilder<S> {
         self.nest(build, |inner| inner)
     }
 
-    /// (...)  Takes the next unnamed index.
+    /// Creates an unnamed capture group.
     pub fn capture<T: State>(
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -543,21 +849,21 @@ impl<S: State> RegexBuilder<S> {
         })
     }
 
-    /// (?<name>...)  Takes no index. Using a name twice is an `Error::DuplicateName`.
+    /// Creates a named capture group.
     pub fn capture_named<T: State>(
         self,
         name: impl Into<String>,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
     ) -> RegexBuilder<Quantifiable> {
         let name = name.into();
+
         self.nest(build, move |inner| Pat::Capture {
             slot: Slot::Name(name),
             inner: Box::new(inner),
         })
     }
 
-    /// (a|b|c): one node, so it can be quantified.
-    /// No branches = matches nothing.
+    /// Creates a pattern containing one or more alternative branches.
     pub fn or(
         self,
         build: impl FnOnce(Alternatives) -> Alternatives,
@@ -566,13 +872,16 @@ impl<S: State> RegexBuilder<S> {
             branches: vec![],
             error: None,
         });
+
         let mut next = self.push(Pat::Alternatives(alternatives.branches));
         next.record(alternatives.error);
         next
     }
 
-    /// Finish the pattern. Reports the mistakes made while building it
-    /// (the first one made), then duplicate capture names.
+    /// Finalizes the builder and turns it into a compiled regex.
+    ///
+    /// This step validates duplicate names and errors encountered while building
+    /// the pattern, then assigns indices for all captures and nested regexes.
     pub fn build(self) -> Result<Regex, Error> {
         if let Some(error) = self.error {
             return Err(error);
@@ -580,63 +889,109 @@ impl<S: State> RegexBuilder<S> {
 
         let pattern = Pat::Sequence(self.nodes);
         let names = pattern.capture_names();
+        let regex_names = pattern.regex_names();
+
         let mut seen = HashSet::new();
-        if let Some(duplicate) = names.iter().find(|name| !seen.insert(name.as_str())) {
-            return Err(Error::DuplicateName(duplicate.clone()));
+
+        for name in names.iter().chain(regex_names.iter()) {
+            if !seen.insert(name.as_str()) {
+                return Err(Error::DuplicateName(name.clone()));
+            }
         }
 
-        let (pattern, unnamed_count) = pattern.numbered(0);
+        let (pattern, unnamed_count, unnamed_regex_count) = pattern.numbered(0, 0);
+
         Ok(Regex {
             pattern,
-            unnamed_count,
-            names,
+            metadata: RegexMetadata {
+                unnamed_count,
+                names,
+                unnamed_regex_count,
+                regex_names,
+            },
         })
     }
 }
 
-// ===== Core: quantifiers =====
-
 impl RegexBuilder<Quantifiable> {
-    /// Repeat the last expression `min` to `max` times (None = unbounded). Greedy.
-    ///   quantify(0, Some(1)) = ?     quantify(0, None) = *     quantify(1, None) = +
-    /// min > max is an `Error::InvalidQuantifier`, reported by `build`.
+    /// Applies a repetition range to the most recently added expression.
+    ///
+    /// The `min` value is the minimum number of repetitions, and `max` is the
+    /// optional maximum. If `min > max`, an `InvalidQuantifier` error is stored.
     pub fn quantify(self, min: usize, max: Option<usize>) -> RegexBuilder<QuantifiedGreedy> {
         let mut next = self.into_state::<QuantifiedGreedy>();
+
         next.record(
             max.filter(|max| min > *max)
                 .map(|max| Error::InvalidQuantifier { min, max }),
         );
+
         let last = next
             .nodes
             .pop()
             .expect("Quantifiable state guarantees an expression to repeat");
+
         next.nodes.push(Pat::Repeat {
             inner: Box::new(last),
             min,
             max,
             lazy: false,
         });
+
         next
+    }
+
+    /// Matches zero or one repetition of the previous expression.
+    pub fn optional(self) -> RegexBuilder<QuantifiedGreedy> {
+        self.quantify(0, Some(1))
+    }
+
+    /// Matches zero or more repetitions of the previous expression.
+    pub fn zero_or_more(self) -> RegexBuilder<QuantifiedGreedy> {
+        self.quantify(0, None)
+    }
+
+    /// Matches one or more repetitions of the previous expression.
+    pub fn one_or_more(self) -> RegexBuilder<QuantifiedGreedy> {
+        self.quantify(1, None)
+    }
+
+    /// Matches exactly `n` repetitions of the previous expression.
+    pub fn exactly(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
+        self.quantify(n, Some(n))
+    }
+
+    /// Matches at least `n` repetitions of the previous expression.
+    pub fn at_least(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
+        self.quantify(n, None)
+    }
+
+    /// Matches at most `n` repetitions of the previous expression.
+    pub fn at_most(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
+        self.quantify(0, Some(n))
+    }
+
+    /// Matches between `min` and `max` repetitions of the previous expression.
+    pub fn between(self, min: usize, max: usize) -> RegexBuilder<QuantifiedGreedy> {
+        self.quantify(min, Some(max))
     }
 }
 
 impl RegexBuilder<QuantifiedGreedy> {
-    /// Make the last quantifier lazy: ??  *?  +?
+    /// Makes the last quantified expression lazy instead of greedy.
     pub fn lazy(self) -> RegexBuilder<AppendOnly> {
         let mut next = self.into_state::<AppendOnly>();
+
         if let Some(Pat::Repeat { lazy, .. }) = next.nodes.last_mut() {
             *lazy = true;
         }
+
         next
     }
 }
 
-// ===== Helpers: built only from the functions above =====
-
-// ----- The word set, shared by \w \W \b \B -----
-
 impl CharSet {
-    /// [a-zA-Z0-9_]
+    /// Builds a default word-character set using letters, digits, and underscore.
     fn word(self) -> CharSet {
         self.range('a', 'z')
             .range('A', 'Z')
@@ -645,117 +1000,88 @@ impl CharSet {
     }
 }
 
-// ----- Alternatives, ranges, character classes and borders (ASCII only, like Ruby) -----
-
 impl<S: State> RegexBuilder<S> {
-    /// (a|b|c) from plain strings.
+    /// Matches any one of the provided string options.
     pub fn any_of<T: Into<String>>(self, options: Vec<T>) -> RegexBuilder<Quantifiable> {
         self.or(|alts| {
             options
                 .into_iter()
-                .fold(alts, |alts, o| alts.branch(|r| r.literal(o)))
+                .fold(alts, |alts, option| alts.branch(|r| r.literal(option)))
         })
     }
 
-    /// One character from `from` to `to`, both included: [a-z]
-    /// from > to is an `Error::InvalidRange`, reported by `build`.
+    /// Matches any character in the inclusive range from `from` to `to`.
     pub fn range(self, from: char, to: char) -> RegexBuilder<Quantifiable> {
         self.any_char_of(|s| s.range(from, to))
     }
 
-    /// Any single character, newlines included.
+    /// Matches any single character.
     pub fn any_char(self) -> RegexBuilder<Quantifiable> {
         self.any_except(|s| s)
     }
 
-    /// \d
+    /// Matches any decimal digit.
     pub fn any_digit(self) -> RegexBuilder<Quantifiable> {
         self.range('0', '9')
     }
-    /// \D
+
+    /// Matches any character that is not a decimal digit.
     pub fn any_non_digit(self) -> RegexBuilder<Quantifiable> {
         self.any_except(|s| s.range('0', '9'))
     }
 
-    /// \w
+    /// Matches any character considered part of a word.
     pub fn any_word(self) -> RegexBuilder<Quantifiable> {
         self.any_char_of(CharSet::word)
     }
-    /// \W
+
+    /// Matches any character that is not part of a word.
     pub fn any_non_word(self) -> RegexBuilder<Quantifiable> {
         self.any_except(CharSet::word)
     }
 
-    /// \s
+    /// Matches any whitespace character.
     pub fn any_whitespace(self) -> RegexBuilder<Quantifiable> {
         self.any_char_of(|s| s.literal(" \t\r\n\x0B\x0C"))
     }
-    /// \S
+
+    /// Matches any non-whitespace character.
     pub fn any_non_whitespace(self) -> RegexBuilder<Quantifiable> {
         self.any_except(|s| s.literal(" \t\r\n\x0B\x0C"))
     }
 
-    /// \h
+    /// Matches any hexadecimal digit.
     pub fn any_hex_digit(self) -> RegexBuilder<Quantifiable> {
         self.any_char_of(|s| s.range('0', '9').range('a', 'f').range('A', 'F'))
     }
-    /// \H
+
+    /// Matches any character that is not a hexadecimal digit.
     pub fn any_non_hex_digit(self) -> RegexBuilder<Quantifiable> {
         self.any_except(|s| s.range('0', '9').range('a', 'f').range('A', 'F'))
     }
 
-    /// [a-zA-Z]
+    /// Matches any alphabetic character.
     pub fn any_letter(self) -> RegexBuilder<Quantifiable> {
         self.any_char_of(|s| s.range('a', 'z').range('A', 'Z'))
     }
-    /// [a-z]
+
+    /// Matches any lowercase alphabetic character.
     pub fn any_lowercase(self) -> RegexBuilder<Quantifiable> {
         self.range('a', 'z')
     }
-    /// [A-Z]
+
+    /// Matches any uppercase alphabetic character.
     pub fn any_uppercase(self) -> RegexBuilder<Quantifiable> {
         self.range('A', 'Z')
     }
 
-    /// \b
+    /// Matches a word boundary.
     pub fn word_border(self) -> RegexBuilder<AppendOnly> {
         self.border_of(CharSet::word)
     }
-    /// \B
+
+    /// Matches a non-word boundary.
     pub fn non_word_border(self) -> RegexBuilder<AppendOnly> {
         self.non_border_of(CharSet::word)
-    }
-}
-
-// ----- Quantifier shortcuts (all greedy; add .lazy() for the lazy version) -----
-
-impl RegexBuilder<Quantifiable> {
-    /// ?
-    pub fn optional(self) -> RegexBuilder<QuantifiedGreedy> {
-        self.quantify(0, Some(1))
-    }
-    /// *
-    pub fn zero_or_more(self) -> RegexBuilder<QuantifiedGreedy> {
-        self.quantify(0, None)
-    }
-    /// +
-    pub fn one_or_more(self) -> RegexBuilder<QuantifiedGreedy> {
-        self.quantify(1, None)
-    }
-    /// {n}
-    pub fn exactly(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
-        self.quantify(n, Some(n))
-    }
-    /// {n,}
-    pub fn at_least(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
-        self.quantify(n, None)
-    }
-    /// {0,n}
-    pub fn at_most(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
-        self.quantify(0, Some(n))
-    }
-    /// {min,max}
-    pub fn between(self, min: usize, max: usize) -> RegexBuilder<QuantifiedGreedy> {
-        self.quantify(min, Some(max))
     }
 }
