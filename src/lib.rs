@@ -1,6 +1,6 @@
 //! A simple functional builder for reusable regular expressions.
 
-#![allow(unused)]
+#![allow(unused, )]
 #![deny(missing_docs)]
 
 // ---------------------------------------------------------------------------
@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// A regex construction state marker.
 ///
@@ -23,13 +23,16 @@ pub trait BuilderState {}
 
 /// Marks the start of a regex builder. New atoms can be appended, but the
 /// pattern cannot be quantified.
+#[derive(Debug)]
 pub struct AppendOnly;
 
 /// Marks a pattern segment that can be quantified.
+#[derive(Debug)]
 pub struct Quantifiable;
 
 /// Marks a segment that was just quantified and may still be converted to a
 /// lazy form.
+#[derive(Debug)]
 pub struct Quantified;
 
 impl BuilderState for AppendOnly {}
@@ -67,6 +70,10 @@ pub enum BuildError {
     /// Signals that an alternative expression (`or` / `any_of` and their named
     /// variants) has no branches.
     EmptyAlternative,
+
+    /// Signals that a recursive regex reference was used to build or match
+    /// before it was defined.
+    UndefinedRecursion,
 }
 
 impl fmt::Display for BuildError {
@@ -84,6 +91,9 @@ impl fmt::Display for BuildError {
                 write!(f, "range start '{from}' comes after its end '{to}'")
             }
             BuildError::EmptyAlternative => write!(f, "alternative expression has no branches"),
+            BuildError::UndefinedRecursion => {
+                write!(f, "recursive regex reference is used before it is defined")
+            }
         }
     }
 }
@@ -111,8 +121,9 @@ impl std::error::Error for BuildError {}
 ///
 /// A group or capture is a `Group` if and only if its inner scope declares at
 /// least one capture location (group, capture, alternative or nested regex).
-/// Nested regexes are always groups, and alternatives are always
-/// `Alternative`, even if they declare no captures themselves.
+/// Nested regexes (including recursive references) are always groups, and
+/// alternatives are always `Alternative`, even if they declare no captures
+/// themselves.
 #[derive(Debug, PartialEq)]
 pub enum CaptureOccurrence {
     /// An occurrence with a nested capture scope.
@@ -277,6 +288,22 @@ enum CaptureSlot {
 /// captures collected on the way there.
 type MatchStates = Vec<(usize, ScopeRecord)>;
 
+/// The recursions currently being evaluated, keyed by (cell address, input
+/// position). An entry that is looked up again while it is still being
+/// evaluated is a left recursion; it is answered with the entry's seed.
+type RecursionMemo = HashMap<(usize, usize), SeedEntry>;
+
+/// Evaluation state of one recursion at one input position.
+struct SeedEntry {
+    /// The matches found so far. Starts empty and grows until it reaches a
+    /// fixed point.
+    seed: MatchStates,
+
+    /// Whether the seed was consulted during the current evaluation, i.e.
+    /// whether the recursion is left-recursive here.
+    used: bool,
+}
+
 /// Captures collected for one scope while evaluating a pattern.
 ///
 /// Each slot maps to its occurrences in production order. Slots that were
@@ -343,6 +370,121 @@ impl ScopeLayout {
     /// True if the scope declares no capture locations at all.
     fn declares_nothing(&self) -> bool {
         self.index_count == 0 && self.declared_names.is_empty()
+    }
+}
+
+/// Counts the distinct end positions among a set of match states.
+fn distinct_ends(states: &MatchStates) -> usize {
+    states
+        .iter()
+        .map(|(end, _)| *end)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Records one occurrence of a recursive reference for every state of the
+/// recursion's body, on top of the capture data of the current scope.
+fn wrap_recursive(
+    slot: &CaptureSlot,
+    position: usize,
+    states: MatchStates,
+    layout: &Arc<ScopeLayout>,
+    scope_data: &ScopeRecord,
+) -> MatchStates {
+    states
+        .into_iter()
+        .map(|(end, inner_data)| {
+            let mut updated = scope_data.clone();
+
+            updated
+                .occurrences
+                .entry(slot.clone())
+                .or_default()
+                .push(RecordedOccurrence {
+                    char_span: (position, end),
+                    kind: RecordedKind::Group(NestedScope {
+                        record: Box::new(inner_data),
+                        layout: layout.clone(),
+                    }),
+                });
+
+            (end, updated)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Recursive regexes
+// ---------------------------------------------------------------------------
+
+/// Write-once storage for the body of a recursive regex.
+struct RecursiveCell {
+    definition: OnceLock<RecursiveDefinition>,
+}
+
+/// The compiled body of a recursive regex.
+struct RecursiveDefinition {
+    root: PatternNode,
+    layout: Arc<ScopeLayout>,
+}
+
+// Manual impl: the body may contain this very cell, so deriving `Debug`
+// would recurse forever.
+impl fmt::Debug for RecursiveCell {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("RecursiveCell")
+            .field("defined", &self.definition.get().is_some())
+            .finish()
+    }
+}
+
+/// A reference to a regex that may refer to itself.
+///
+/// Created with [`RegexBuilder::recursive`], embedded with
+/// [`RegexBuilder::recurse`] or [`RegexBuilder::named_recurse`] (even before
+/// it is defined) and finished exactly once with [`RecursiveRegex::define`].
+///
+/// An occurrence of a recursive reference is always a
+/// [`CaptureOccurrence::Group`] whose nested captures are those of the
+/// recursive regex's own top-level scope.
+///
+/// Left recursion (for example `expr = expr "+" digit | digit`) is supported:
+/// the recursion is re-evaluated until it stops reaching new end positions.
+#[derive(Debug)]
+pub struct RecursiveRegex {
+    cell: Arc<RecursiveCell>,
+}
+
+impl RecursiveRegex {
+    /// Defines the recursive regex and returns it as a [`Regex`].
+    ///
+    /// Consumes the reference, so it can only be defined once. The builder
+    /// may embed this reference (or other recursive references) directly or
+    /// indirectly. Other references may still be undefined here; using the
+    /// result to build or match is an error until they are defined.
+    ///
+    /// Because this consumes the reference, build the `builder` first and
+    /// then call `define`; the builder only borrows the reference while it
+    /// is being constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error recorded by the builder, or a scope validation error
+    /// such as [`BuildError::DuplicateName`].
+    pub fn define<T: BuilderState>(
+        self,
+        builder: RegexBuilder<T>,
+    ) -> Result<Regex, BuildError> {
+        let (root, layout) = builder.finish()?;
+        let layout = Arc::new(layout);
+
+        // `self` is consumed, so the cell cannot have been defined before.
+        let _ = self.cell.definition.set(RecursiveDefinition {
+            root: root.clone(),
+            layout: layout.clone(),
+        });
+
+        Ok(Regex { root, layout })
     }
 }
 
@@ -414,6 +556,13 @@ enum PatternNode {
         layout: Arc<ScopeLayout>,
     },
 
+    /// A reference to a recursive regex (a scope of its own). The body and
+    /// its layout are looked up in the cell at match time.
+    Recursive {
+        slot: CaptureSlot,
+        cell: Arc<RecursiveCell>,
+    },
+
     /// A quantified subpattern.
     Repeat {
         inner: Box<PatternNode>,
@@ -427,8 +576,15 @@ impl PatternNode {
     /// Attempts to run this pattern from `position` in the input.
     ///
     /// Returns every way the pattern can match, in priority order, each with
-    /// the capture data collected so far for the *current* scope.
-    fn match_at(&self, input: &[char], position: usize, scope_data: ScopeRecord) -> MatchStates {
+    /// the capture data collected so far for the *current* scope. `memo`
+    /// tracks the recursions currently being evaluated.
+    fn match_at(
+        &self,
+        input: &[char],
+        position: usize,
+        scope_data: ScopeRecord,
+        memo: &mut RecursionMemo,
+    ) -> MatchStates {
         match self {
             PatternNode::Literal(text) if input[position..].starts_with(text) => {
                 vec![(position + text.len(), scope_data)]
@@ -463,7 +619,7 @@ impl PatternNode {
                         states
                             .into_iter()
                             .flat_map(|(state_position, state_data)| {
-                                node.match_at(input, state_position, state_data)
+                                node.match_at(input, state_position, state_data, memo)
                             })
                             .collect()
                     })
@@ -482,7 +638,7 @@ impl PatternNode {
 
                 for (branch_index, branch_pattern) in branches.iter().enumerate() {
                     for (end, branch_data) in
-                        branch_pattern.match_at(input, position, ScopeRecord::default())
+                        branch_pattern.match_at(input, position, ScopeRecord::default(), memo)
                     {
                         let mut updated = scope_data.clone();
 
@@ -516,7 +672,7 @@ impl PatternNode {
                 layout,
             } => {
                 inner
-                    .match_at(input, position, ScopeRecord::default())
+                    .match_at(input, position, ScopeRecord::default(), memo)
                     .into_iter()
                     .map(|(end, inner_data)| {
                         let mut updated = scope_data.clone();
@@ -546,7 +702,7 @@ impl PatternNode {
                 layout,
             } => {
                 inner
-                    .match_at(input, position, ScopeRecord::default())
+                    .match_at(input, position, ScopeRecord::default(), memo)
                     .into_iter()
                     .map(|(end, inner_data)| {
                         let mut updated = scope_data.clone();
@@ -566,12 +722,72 @@ impl PatternNode {
                     .collect()
             }
 
+            // Like `Embedded`, but the body comes from the shared cell.
+            //
+            // Entering the same recursion at the same position while it is
+            // still being evaluated means it is left-recursive there. That
+            // inner entry is answered with the matches found so far (the
+            // seed, initially none). The body is then evaluated again with
+            // the grown seed until it stops reaching new end positions, which
+            // makes the recursion terminate and still match left-nested input.
+            PatternNode::Recursive { slot, cell } => {
+                let Some(definition) = cell.definition.get() else {
+                    return vec![]; // unreachable: definedness is checked before matching
+                };
+
+                let key = (Arc::as_ptr(cell) as usize, position);
+
+                if let Some(entry) = memo.get_mut(&key) {
+                    entry.used = true;
+                    let seed = entry.seed.clone();
+                    return wrap_recursive(slot, position, seed, &definition.layout, &scope_data);
+                }
+
+                memo.insert(
+                    key,
+                    SeedEntry {
+                        seed: vec![],
+                        used: false,
+                    },
+                );
+
+                let inner_results = loop {
+                    let results = definition.root.match_at(
+                        input,
+                        position,
+                        ScopeRecord::default(),
+                        memo,
+                    );
+
+                    let entry = memo
+                        .get_mut(&key)
+                        .expect("a recursion entry exists while it is being evaluated");
+
+                    if !entry.used || distinct_ends(&results) <= distinct_ends(&entry.seed) {
+                        break results;
+                    }
+
+                    entry.seed = results;
+                    entry.used = false;
+                };
+
+                memo.remove(&key);
+
+                wrap_recursive(
+                    slot,
+                    position,
+                    inner_results,
+                    &definition.layout,
+                    &scope_data,
+                )
+            }
+
             PatternNode::Repeat {
                 inner,
                 min,
                 max,
                 lazy,
-            } => inner.match_repeat(*min, *max, *lazy, input, position, scope_data, 0),
+            } => inner.match_repeat(*min, *max, *lazy, input, position, scope_data, 0, memo),
         }
     }
 
@@ -589,6 +805,7 @@ impl PatternNode {
         position: usize,
         scope_data: ScopeRecord,
         completed: usize,
+        memo: &mut RecursionMemo,
     ) -> MatchStates {
         let stopped: MatchStates = if completed >= min {
             vec![(position, scope_data.clone())]
@@ -597,11 +814,11 @@ impl PatternNode {
         };
 
         let extended: MatchStates = if max.map_or(true, |limit| completed < limit) {
-            self.match_at(input, position, scope_data)
+            self.match_at(input, position, scope_data, memo)
                 .into_iter()
                 .filter(|(end, _)| !(*end == position && completed >= min))
                 .flat_map(|(end, next_data)| {
-                    self.match_repeat(min, max, lazy, input, end, next_data, completed + 1)
+                    self.match_repeat(min, max, lazy, input, end, next_data, completed + 1, memo)
                 })
                 .collect()
         } else {
@@ -612,6 +829,36 @@ impl PatternNode {
             [stopped, extended].concat()
         } else {
             [extended, stopped].concat()
+        }
+    }
+
+    /// Returns true if this pattern depends on a recursive reference that is
+    /// not defined yet.
+    ///
+    /// Definitions are followed transitively; `seen` holds the cells already
+    /// visited, which also breaks cycles.
+    fn has_undefined(&self, seen: &mut HashSet<*const RecursiveCell>) -> bool {
+        match self {
+            PatternNode::Literal(_)
+            | PatternNode::CharClass { .. }
+            | PatternNode::Boundary { .. } => false,
+
+            PatternNode::Sequence(nodes) => nodes.iter().any(|node| node.has_undefined(seen)),
+
+            PatternNode::Alternation { branches, .. } => {
+                branches.iter().any(|branch| branch.has_undefined(seen))
+            }
+
+            PatternNode::Capturing { inner, .. }
+            | PatternNode::Embedded { inner, .. }
+            | PatternNode::Repeat { inner, .. } => inner.has_undefined(seen),
+
+            PatternNode::Recursive { cell, .. } => match cell.definition.get() {
+                None => true,
+                Some(definition) => {
+                    seen.insert(Arc::as_ptr(cell)) && definition.root.has_undefined(seen)
+                }
+            },
         }
     }
 
@@ -645,10 +892,11 @@ impl PatternNode {
 
     /// Assigns indexes within the current scope.
     ///
-    /// Unnamed groups, unnamed alternatives and unnamed nested regexes draw
-    /// from the same counter, so they share one index space. Nested group,
-    /// capture and branch scopes restart their own numbering; nested regexes
-    /// are already compiled and are not descended into.
+    /// Unnamed groups, unnamed alternatives, unnamed nested regexes and
+    /// unnamed recursive references draw from the same counter, so they share
+    /// one index space. Nested group, capture and branch scopes restart their
+    /// own numbering; nested regexes and recursive references are already
+    /// compiled (or compiled separately) and are not descended into.
     fn assign_indexes(self, counter: &mut usize) -> Result<PatternNode, BuildError> {
         Ok(match self {
             PatternNode::Sequence(nodes) => {
@@ -707,6 +955,14 @@ impl PatternNode {
                 layout,
             },
 
+            PatternNode::Recursive { slot, cell } => PatternNode::Recursive {
+                slot: match slot {
+                    CaptureSlot::Index(_) => CaptureSlot::Index(next_index(counter)),
+                    named_slot => named_slot,
+                },
+                cell,
+            },
+
             PatternNode::Repeat {
                 inner,
                 min,
@@ -737,10 +993,11 @@ impl PatternNode {
 
     /// Collects the names declared directly in the current scope.
     ///
-    /// Named captures, named alternatives and named nested regexes share one
-    /// namespace. Contents of groups, captures, alternative branches and
-    /// nested regexes are excluded because each opens its own scope with its
-    /// own namespace.
+    /// Named captures, named alternatives, named nested regexes and named
+    /// recursive references share one namespace. Contents of groups,
+    /// captures, alternative branches, nested regexes and recursive
+    /// references are excluded because each opens its own scope with its own
+    /// namespace.
     fn declare_scope_names(&self) -> Vec<String> {
         match self {
             PatternNode::Sequence(nodes) => nodes
@@ -755,6 +1012,10 @@ impl PatternNode {
                 ..
             }
             | PatternNode::Embedded {
+                slot: CaptureSlot::Name(name),
+                ..
+            }
+            | PatternNode::Recursive {
                 slot: CaptureSlot::Name(name),
                 ..
             }
@@ -854,6 +1115,7 @@ fn add_literal_branches<T: Into<String>>(
 // ---------------------------------------------------------------------------
 
 /// A stateful builder for regex patterns.
+#[derive(Debug)]
 pub struct RegexBuilder<S: BuilderState> {
     /// The sequence of compiled pattern nodes currently assembled.
     nodes: Vec<PatternNode>,
@@ -874,6 +1136,20 @@ impl RegexBuilder<AppendOnly> {
             _state: PhantomData,
         }
     }
+
+    /// Creates an undefined recursive regex reference.
+    ///
+    /// The reference can be embedded with [`RegexBuilder::recurse`] before it
+    /// is defined. Define it exactly once with [`RecursiveRegex::define`].
+    /// Using a regex that depends on a still undefined reference to build or
+    /// match is a [`BuildError::UndefinedRecursion`] error.
+    pub fn recursive() -> RecursiveRegex {
+        RecursiveRegex {
+            cell: Arc::new(RecursiveCell {
+                definition: OnceLock::new(),
+            }),
+        }
+    }
 }
 
 /// A fully compiled regex pattern with its scope layout.
@@ -887,6 +1163,16 @@ pub struct Regex {
 }
 
 impl Regex {
+    /// Fails if this regex depends on a recursive reference that has not
+    /// been defined yet.
+    fn ensure_defined(&self) -> Result<(), BuildError> {
+        if self.root.has_undefined(&mut HashSet::new()) {
+            Err(BuildError::UndefinedRecursion)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Attempts to match the entire input and returns the captures for the
     /// successful match.
     ///
@@ -894,17 +1180,24 @@ impl Regex {
     /// it does, the hierarchical capture data is returned; otherwise `None`.
     /// When several matches are possible, the first one in greedy/lazy
     /// priority order wins.
-    fn full_match(&self, input: impl Into<String>) -> Option<Captures> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::UndefinedRecursion`] if the regex depends on a
+    /// recursive reference that has not been defined yet.
+    pub fn full_match(&self, input: impl Into<String>) -> Result<Option<Captures>, BuildError> {
+        self.ensure_defined()?;
+
         let chars: Vec<char> = input.into().chars().collect();
 
         let winning_data = self
             .root
-            .match_at(&chars, 0, ScopeRecord::default())
+            .match_at(&chars, 0, ScopeRecord::default(), &mut HashMap::new())
             .into_iter()
             .find(|(end, _)| *end == chars.len())
-            .map(|(_, data)| data)?;
+            .map(|(_, data)| data);
 
-        Some(build_captures(&winning_data, &chars, &self.layout))
+        Ok(winning_data.map(|data| build_captures(&data, &chars, &self.layout)))
     }
 }
 
@@ -1074,6 +1367,16 @@ impl<S: BuilderState> RegexBuilder<S> {
         next
     }
 
+    /// Reports any recorded error, then validates duplicate names and assigns
+    /// indexes for the top-level scope. Shared by `build` and `define`.
+    fn finish(self) -> Result<(PatternNode, ScopeLayout), BuildError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+
+        PatternNode::Sequence(self.nodes).compile_scope()
+    }
+
     /// Adds a literal text atom to the pattern.
     pub fn literal(self, text: impl Into<String>) -> RegexBuilder<Quantifiable> {
         self.append_node(PatternNode::Literal(text.into().chars().collect()))
@@ -1102,6 +1405,34 @@ impl<S: BuilderState> RegexBuilder<S> {
             slot: CaptureSlot::Name(name.into()),
             inner: Box::new(regex.root.clone()),
             layout: regex.layout.clone(),
+        })
+    }
+
+    /// Appends a reference to a recursive regex, which may still be undefined.
+    ///
+    /// The reference occupies the next free index in the current scope,
+    /// sharing the index space with unnamed groups, alternatives and nested
+    /// regexes. Its occurrences are always groups carrying the captures of the
+    /// recursive regex's top-level scope.
+    pub fn recurse(self, recursive: &RecursiveRegex) -> RegexBuilder<Quantifiable> {
+        self.append_node(PatternNode::Recursive {
+            slot: CaptureSlot::Index(0), // placeholder, assigned in `build`
+            cell: recursive.cell.clone(),
+        })
+    }
+
+    /// Appends a reference to a recursive regex under a name.
+    ///
+    /// The name is registered in the current scope's name namespace together
+    /// with named captures, named alternatives and named nested regexes.
+    pub fn named_recurse(
+        self,
+        name: impl Into<String>,
+        recursive: &RecursiveRegex,
+    ) -> RegexBuilder<Quantifiable> {
+        self.append_node(PatternNode::Recursive {
+            slot: CaptureSlot::Name(name.into()),
+            cell: recursive.cell.clone(),
         })
     }
 
@@ -1221,17 +1552,22 @@ impl<S: BuilderState> RegexBuilder<S> {
     /// Reports any error recorded while building, then validates duplicate
     /// names and assigns indexes scope by scope: the top level first, then each
     /// group's, capture's and alternative branch's inner scope independently.
+    ///
+    /// # Errors
+    ///
+    /// Also returns [`BuildError::UndefinedRecursion`] if the pattern depends
+    /// on a recursive reference that has not been defined yet.
     pub fn build(self) -> Result<Regex, BuildError> {
-        if let Some(error) = self.error {
-            return Err(error);
-        }
+        let (root, layout) = self.finish()?;
 
-        let (root, layout) = PatternNode::Sequence(self.nodes).compile_scope()?;
-
-        Ok(Regex {
+        let regex = Regex {
             root,
             layout: Arc::new(layout),
-        })
+        };
+
+        regex.ensure_defined()?;
+
+        Ok(regex)
     }
 }
 
@@ -1394,5 +1730,207 @@ impl<S: BuilderState> RegexBuilder<S> {
     /// Matches a non-word boundary.
     pub fn non_word_border(self) -> RegexBuilder<AppendOnly> {
         self.non_border_of(CharSetBuilder::word_chars)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+
+/// Matched text longer than this is shortened in `{}` output; `{:#}` prints it in full.
+const DISPLAY_TEXT_LIMIT: usize = 40;
+
+impl Captures {
+    /// True if the scope declares no capture locations at all.
+    fn is_empty(&self) -> bool {
+        self.indexed.is_empty() && self.by_name.is_empty()
+    }
+}
+
+/// Quotes and escapes matched text, shortening it unless `full` is set.
+fn quoted(text: &str, full: bool) -> String {
+    if full || text.chars().count() <= DISPLAY_TEXT_LIMIT {
+        format!("{text:?}")
+    } else {
+        let short: String = text.chars().take(DISPLAY_TEXT_LIMIT - 1).collect();
+        format!("{short:?}...")
+    }
+}
+
+/// Appends the lines describing one scope: indexed locations in order, then
+/// named locations alphabetically
+fn push_captures(captures: &Captures, depth: usize, full: bool, out: &mut Vec<String>) {
+    if captures.is_empty() {
+        out.push(format!("{}(no captures)", "  ".repeat(depth)));
+        return;
+    }
+
+    for (index, occurrences) in captures.indexed.iter().enumerate() {
+        push_location(&format!("[{index}]"), occurrences, depth, full, out);
+    }
+
+    let mut names: Vec<&String> = captures.by_name.keys().collect();
+    names.sort();
+
+    for name in names {
+        push_location(&format!("{name:?}"), &captures.by_name[name], depth, full, out);
+    }
+}
+
+/// Appends the lines describing one capture location and its occurrences.
+fn push_location(
+    label: &str,
+    occurrences: &[CaptureOccurrence],
+    depth: usize,
+    full: bool,
+    out: &mut Vec<String>,
+) {
+    let pad = "  ".repeat(depth);
+
+    if occurrences.is_empty() {
+        out.push(format!("{pad}{label}: not taken"));
+        return;
+    }
+
+    out.push(format!("{pad}{label}:"));
+
+    for occurrence in occurrences {
+        push_occurrence(occurrence, depth + 1, full, out);
+    }
+}
+
+/// Appends the lines describing one occurrence. Nested scopes without any
+/// capture locations are left out, since there is nothing to show.
+fn push_occurrence(
+    occurrence: &CaptureOccurrence,
+    depth: usize,
+    full: bool,
+    out: &mut Vec<String>
+) {
+    let pad = "  ".repeat(depth);
+
+    match occurrence {
+        CaptureOccurrence::Literal(text) => {
+            out.push(format!("{pad}- literal {}", quoted(text, full)));
+        }
+
+        CaptureOccurrence::Group { matched, nested } => {
+            out.push(format!("{pad}- group {}", quoted(matched, full)));
+
+            if !nested.is_empty() {
+                push_captures(nested, depth + 1, full, out);
+            }
+        }
+
+        CaptureOccurrence::Alternative {
+            matched,
+            branch_index,
+            nested,
+        } => {
+            out.push(format!(
+                "{pad}- branch {branch_index} {}",
+                quoted(matched, full)
+            ));
+
+            if !nested.is_empty() {
+                push_captures(nested, depth + 1, full, out);
+            }
+        }
+    }
+}
+
+impl fmt::Display for Captures {
+    /// Prints the capture tree. Use `{:#}` to print matched text in full
+    /// instead of shortening long text.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut lines = Vec::new();
+        push_captures(self, 0, f.alternate(), &mut lines);
+        write!(f, "{}", lines.join("\n"))
+    }
+}
+
+impl fmt::Display for CaptureOccurrence {
+    /// Prints one occurrence and everything nested inside it. Use `{:#}` to
+    /// print matched text in full instead of shortening long text.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut lines = Vec::new();
+        push_occurrence(self, 0, f.alternate(), &mut lines);
+        write!(f, "{}", lines.join("\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod recursive_tests {
+    use super::*;
+
+    #[test]
+    fn balanced_parentheses() {
+        let expr = RegexBuilder::recursive();
+        let body = RegexBuilder::new()
+            .literal("(")
+            .recurse(&expr)
+            .zero_or_more()
+            .literal(")");
+        let balanced = expr.define(body).unwrap();
+
+        let caps = balanced.full_match("(()())").unwrap().unwrap();
+        let inner = caps.at_index(0).unwrap();
+
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner[0].matched_text(), "()");
+        assert_eq!(inner[1].matched_text(), "()");
+        assert!(inner[0].expect_group().at_index(0).unwrap().is_empty());
+
+        assert!(balanced.full_match("(()").unwrap().is_none());
+        assert!(balanced.full_match("").unwrap().is_none());
+    }
+
+    #[test]
+    fn left_recursion_matches_left_nested_input() {
+        let sum = RegexBuilder::recursive();
+        let body = RegexBuilder::new().or(|alt| {
+            alt.branch(|b| b.recurse(&sum).literal("+").any_digit())
+                .branch(|b| b.any_digit())
+        });
+        let sum = sum.define(body).unwrap();
+
+        assert!(sum.full_match("1").unwrap().is_some());
+        assert!(sum.full_match("1+2").unwrap().is_some());
+        assert!(sum.full_match("1+2+3").unwrap().is_some());
+        assert!(sum.full_match("1+").unwrap().is_none());
+        assert!(sum.full_match("+1").unwrap().is_none());
+    }
+
+    #[test]
+    fn indirect_recursion_through_another_regex() {
+        let even = RegexBuilder::recursive();
+        let odd = RegexBuilder::recursive();
+
+        // `even` is still undefined here, which `define` allows.
+        let odd_body = RegexBuilder::new().literal("a").recurse(&even);
+        let odd_regex = odd.define(odd_body).unwrap();
+
+        let even_body = RegexBuilder::new().or(|alt| {
+            alt.branch(|b| b.literal(""))
+                .branch(|b| b.literal("a").regex(&odd_regex))
+        });
+        let even_regex = even.define(even_body).unwrap();
+
+        assert!(even_regex.full_match("").unwrap().is_some());
+        assert!(even_regex.full_match("aaaa").unwrap().is_some());
+        assert!(even_regex.full_match("aaa").unwrap().is_none());
+        assert!(odd_regex.full_match("aaa").unwrap().is_some());
+    }
+
+    #[test]
+    fn undefined_reference_is_an_error() {
+        let r = RegexBuilder::recursive();
+        let result = RegexBuilder::new().literal("a").recurse(&r).build();
+
+        assert_eq!(result.err(), Some(BuildError::UndefinedRecursion));
     }
 }
