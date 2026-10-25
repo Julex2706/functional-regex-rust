@@ -285,10 +285,21 @@ enum CaptureSlot {
 /// captures collected on the way there.
 type MatchStates = Vec<(usize, ScopeRecord)>;
 
-/// Recursion entries currently being matched: (cell address, input position).
-///
-/// Used to cut off left recursion, which would otherwise never terminate.
-type ActiveRecursions = Vec<(usize, usize)>;
+/// The recursions currently being evaluated, keyed by (cell address, input
+/// position). An entry that is looked up again while it is still being
+/// evaluated is a left recursion; it is answered with the entry's seed.
+type RecursionMemo = HashMap<(usize, usize), SeedEntry>;
+
+/// Evaluation state of one recursion at one input position.
+struct SeedEntry {
+    /// The matches found so far. Starts empty and grows until it reaches a
+    /// fixed point.
+    seed: MatchStates,
+
+    /// Whether the seed was consulted during the current evaluation, i.e.
+    /// whether the recursion is left-recursive here.
+    used: bool,
+}
 
 /// Captures collected for one scope while evaluating a pattern.
 ///
@@ -359,6 +370,46 @@ impl ScopeLayout {
     }
 }
 
+/// Counts the distinct end positions among a set of match states.
+fn distinct_ends(states: &MatchStates) -> usize {
+    states
+        .iter()
+        .map(|(end, _)| *end)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Records one occurrence of a recursive reference for every state of the
+/// recursion's body, on top of the capture data of the current scope.
+fn wrap_recursive(
+    slot: &CaptureSlot,
+    position: usize,
+    states: MatchStates,
+    layout: &Arc<ScopeLayout>,
+    scope_data: &ScopeRecord,
+) -> MatchStates {
+    states
+        .into_iter()
+        .map(|(end, inner_data)| {
+            let mut updated = scope_data.clone();
+
+            updated
+                .occurrences
+                .entry(slot.clone())
+                .or_default()
+                .push(RecordedOccurrence {
+                    char_span: (position, end),
+                    kind: RecordedKind::Group(NestedScope {
+                        record: Box::new(inner_data),
+                        layout: layout.clone(),
+                    }),
+                });
+
+            (end, updated)
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Recursive regexes
 // ---------------------------------------------------------------------------
@@ -394,8 +445,8 @@ impl fmt::Debug for RecursiveCell {
 /// [`CaptureOccurrence::Group`] whose nested captures are those of the
 /// recursive regex's own top-level scope.
 ///
-/// Left recursion (re-entering the same recursive regex at the same input
-/// position without consuming anything) never matches instead of looping.
+/// Left recursion (for example `expr = expr "+" digit | digit`) is supported:
+/// the recursion is re-evaluated until it stops reaching new end positions.
 #[derive(Debug)]
 pub struct RecursiveRegex {
     cell: Arc<RecursiveCell>,
@@ -522,14 +573,14 @@ impl PatternNode {
     /// Attempts to run this pattern from `position` in the input.
     ///
     /// Returns every way the pattern can match, in priority order, each with
-    /// the capture data collected so far for the *current* scope. `active`
-    /// tracks the recursions being matched, which cuts off left recursion.
+    /// the capture data collected so far for the *current* scope. `memo`
+    /// tracks the recursions currently being evaluated.
     fn match_at(
         &self,
         input: &[char],
         position: usize,
         scope_data: ScopeRecord,
-        active: &mut ActiveRecursions,
+        memo: &mut RecursionMemo,
     ) -> MatchStates {
         match self {
             PatternNode::Literal(text) if input[position..].starts_with(text) => {
@@ -565,7 +616,7 @@ impl PatternNode {
                         states
                             .into_iter()
                             .flat_map(|(state_position, state_data)| {
-                                node.match_at(input, state_position, state_data, active)
+                                node.match_at(input, state_position, state_data, memo)
                             })
                             .collect()
                     })
@@ -584,7 +635,7 @@ impl PatternNode {
 
                 for (branch_index, branch_pattern) in branches.iter().enumerate() {
                     for (end, branch_data) in
-                        branch_pattern.match_at(input, position, ScopeRecord::default(), active)
+                        branch_pattern.match_at(input, position, ScopeRecord::default(), memo)
                     {
                         let mut updated = scope_data.clone();
 
@@ -618,7 +669,7 @@ impl PatternNode {
                 layout,
             } => {
                 inner
-                    .match_at(input, position, ScopeRecord::default(), active)
+                    .match_at(input, position, ScopeRecord::default(), memo)
                     .into_iter()
                     .map(|(end, inner_data)| {
                         let mut updated = scope_data.clone();
@@ -648,7 +699,7 @@ impl PatternNode {
                 layout,
             } => {
                 inner
-                    .match_at(input, position, ScopeRecord::default(), active)
+                    .match_at(input, position, ScopeRecord::default(), memo)
                     .into_iter()
                     .map(|(end, inner_data)| {
                         let mut updated = scope_data.clone();
@@ -668,44 +719,64 @@ impl PatternNode {
                     .collect()
             }
 
-            // Like `Embedded`, but the body comes from the shared cell. Entering
-            // the same recursion at the same position again, without having
-            // consumed any input, can never terminate, so that path fails.
+            // Like `Embedded`, but the body comes from the shared cell.
+            //
+            // Entering the same recursion at the same position while it is
+            // still being evaluated means it is left-recursive there. That
+            // inner entry is answered with the matches found so far (the
+            // seed, initially none). The body is then evaluated again with
+            // the grown seed until it stops reaching new end positions, which
+            // makes the recursion terminate and still match left-nested input.
             PatternNode::Recursive { slot, cell } => {
                 let Some(definition) = cell.definition.get() else {
                     return vec![]; // unreachable: definedness is checked before matching
                 };
 
                 let key = (Arc::as_ptr(cell) as usize, position);
-                if active.contains(&key) {
-                    return vec![];
+
+                if let Some(entry) = memo.get_mut(&key) {
+                    entry.used = true;
+                    let seed = entry.seed.clone();
+                    return wrap_recursive(slot, position, seed, &definition.layout, &scope_data);
                 }
 
-                active.push(key);
-                let inner_results =
-                    definition
-                        .root
-                        .match_at(input, position, ScopeRecord::default(), active);
-                active.pop();
+                memo.insert(
+                    key,
+                    SeedEntry {
+                        seed: vec![],
+                        used: false,
+                    },
+                );
 
-                inner_results
-                    .into_iter()
-                    .map(|(end, inner_data)| {
-                        let mut updated = scope_data.clone();
+                let inner_results = loop {
+                    let results = definition.root.match_at(
+                        input,
+                        position,
+                        ScopeRecord::default(),
+                        memo,
+                    );
 
-                        updated.occurrences.entry(slot.clone()).or_default().push(
-                            RecordedOccurrence {
-                                char_span: (position, end),
-                                kind: RecordedKind::Group(NestedScope {
-                                    record: Box::new(inner_data),
-                                    layout: definition.layout.clone(),
-                                }),
-                            },
-                        );
+                    let entry = memo
+                        .get_mut(&key)
+                        .expect("a recursion entry exists while it is being evaluated");
 
-                        (end, updated)
-                    })
-                    .collect()
+                    if !entry.used || distinct_ends(&results) <= distinct_ends(&entry.seed) {
+                        break results;
+                    }
+
+                    entry.seed = results;
+                    entry.used = false;
+                };
+
+                memo.remove(&key);
+
+                wrap_recursive(
+                    slot,
+                    position,
+                    inner_results,
+                    &definition.layout,
+                    &scope_data,
+                )
             }
 
             PatternNode::Repeat {
@@ -713,7 +784,7 @@ impl PatternNode {
                 min,
                 max,
                 lazy,
-            } => inner.match_repeat(*min, *max, *lazy, input, position, scope_data, 0, active),
+            } => inner.match_repeat(*min, *max, *lazy, input, position, scope_data, 0, memo),
         }
     }
 
@@ -731,7 +802,7 @@ impl PatternNode {
         position: usize,
         scope_data: ScopeRecord,
         completed: usize,
-        active: &mut ActiveRecursions,
+        memo: &mut RecursionMemo,
     ) -> MatchStates {
         let stopped: MatchStates = if completed >= min {
             vec![(position, scope_data.clone())]
@@ -740,11 +811,11 @@ impl PatternNode {
         };
 
         let extended: MatchStates = if max.map_or(true, |limit| completed < limit) {
-            self.match_at(input, position, scope_data, active)
+            self.match_at(input, position, scope_data, memo)
                 .into_iter()
                 .filter(|(end, _)| !(*end == position && completed >= min))
                 .flat_map(|(end, next_data)| {
-                    self.match_repeat(min, max, lazy, input, end, next_data, completed + 1, active)
+                    self.match_repeat(min, max, lazy, input, end, next_data, completed + 1, memo)
                 })
                 .collect()
         } else {
@@ -1117,7 +1188,7 @@ impl Regex {
 
         let winning_data = self
             .root
-            .match_at(&chars, 0, ScopeRecord::default(), &mut Vec::new())
+            .match_at(&chars, 0, ScopeRecord::default(), &mut HashMap::new())
             .into_iter()
             .find(|(end, _)| *end == chars.len())
             .map(|(_, data)| data);
@@ -1655,5 +1726,81 @@ impl<S: BuilderState> RegexBuilder<S> {
     /// Matches a non-word boundary.
     pub fn non_word_border(self) -> RegexBuilder<AppendOnly> {
         self.non_border_of(CharSetBuilder::word_chars)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod recursive_tests {
+    use super::*;
+
+    #[test]
+    fn balanced_parentheses() {
+        let expr = RegexBuilder::recursive();
+        let body = RegexBuilder::new()
+            .literal("(")
+            .recurse(&expr)
+            .zero_or_more()
+            .literal(")");
+        let balanced = expr.define(body).unwrap();
+
+        let caps = balanced.full_match("(()())").unwrap().unwrap();
+        let inner = caps.at_index(0).unwrap();
+
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner[0].matched_text(), "()");
+        assert_eq!(inner[1].matched_text(), "()");
+        assert!(inner[0].expect_group().at_index(0).unwrap().is_empty());
+
+        assert!(balanced.full_match("(()").unwrap().is_none());
+        assert!(balanced.full_match("").unwrap().is_none());
+    }
+
+    #[test]
+    fn left_recursion_matches_left_nested_input() {
+        let sum = RegexBuilder::recursive();
+        let body = RegexBuilder::new().or(|alt| {
+            alt.branch(|b| b.recurse(&sum).literal("+").any_digit())
+                .branch(|b| b.any_digit())
+        });
+        let sum = sum.define(body).unwrap();
+
+        assert!(sum.full_match("1").unwrap().is_some());
+        assert!(sum.full_match("1+2").unwrap().is_some());
+        assert!(sum.full_match("1+2+3").unwrap().is_some());
+        assert!(sum.full_match("1+").unwrap().is_none());
+        assert!(sum.full_match("+1").unwrap().is_none());
+    }
+
+    #[test]
+    fn indirect_recursion_through_another_regex() {
+        let even = RegexBuilder::recursive();
+        let odd = RegexBuilder::recursive();
+
+        // `even` is still undefined here, which `define` allows.
+        let odd_body = RegexBuilder::new().literal("a").recurse(&even);
+        let odd_regex = odd.define(odd_body).unwrap();
+
+        let even_body = RegexBuilder::new().or(|alt| {
+            alt.branch(|b| b.literal(""))
+                .branch(|b| b.literal("a").regex(&odd_regex))
+        });
+        let even_regex = even.define(even_body).unwrap();
+
+        assert!(even_regex.full_match("").unwrap().is_some());
+        assert!(even_regex.full_match("aaaa").unwrap().is_some());
+        assert!(even_regex.full_match("aaa").unwrap().is_none());
+        assert!(odd_regex.full_match("aaa").unwrap().is_some());
+    }
+
+    #[test]
+    fn undefined_reference_is_an_error() {
+        let r = RegexBuilder::recursive();
+        let result = RegexBuilder::new().literal("a").recurse(&r).build();
+
+        assert_eq!(result.err(), Some(BuildError::UndefinedRecursion));
     }
 }
