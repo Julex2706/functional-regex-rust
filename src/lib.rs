@@ -84,27 +84,27 @@ impl std::error::Error for Error {}
 /// The variant describes the *kind* of capture, not whether it matched: both
 /// variants always represent a successful match of that occurrence.
 ///
-/// * [`CaptureType::Group`] is a capture (or nested regex) that contains its
-///   own capture locations. It carries the nested [`Captures`] of this
+/// * [`CaptureType::Group`] is a group, capture, or nested regex that contains
+///   its own capture locations. It carries the nested [`Captures`] of this
 ///   occurrence.
-/// * [`CaptureType::Literal`] is a capture that contains no capture locations
-///   of its own, so only its matched text is retained.
+/// * [`CaptureType::Literal`] is a group or capture that contains no capture
+///   locations of its own, so only its matched text is retained.
 ///
-/// A capture is a `Group` if and only if its inner scope declares at least one
-/// capture location (capture or nested regex). Nested regexes are always
-/// groups, even if they declare no captures themselves.
+/// An occurrence is a `Group` if and only if its inner scope declares at least
+/// one capture location (group, capture or nested regex). Nested regexes are
+/// always groups, even if they declare no captures themselves.
 #[derive(Debug, PartialEq)]
 pub enum CaptureType {
-    /// A capture with a nested capture scope.
+    /// An occurrence with a nested capture scope.
     Group {
-        /// The complete text consumed by this group occurrence, including text
+        /// The complete text consumed by this occurrence, including text
         /// matched by expressions that are not individually addressable.
         full: String,
         /// The captures declared inside this occurrence.
         captures: Captures,
     },
 
-    /// A capture without nested capture locations.
+    /// An occurrence without nested capture locations.
     Literal(String),
 }
 
@@ -160,7 +160,7 @@ impl CaptureType {
 
 /// The capture results of one regex scope.
 ///
-/// Unnamed captures and unnamed nested regexes share a single zero-based index
+/// Unnamed groups and unnamed nested regexes share a single zero-based index
 /// space. Named captures and named nested regexes share a single name
 /// namespace. Both accessors return the same kind of result: the ordered
 /// occurrences of that capture location.
@@ -178,7 +178,7 @@ pub struct Captures {
 }
 
 impl Captures {
-    /// Returns the occurrences of the nth unnamed capture or unnamed nested
+    /// Returns the occurrences of the nth unnamed group or unnamed nested
     /// regex in this scope, counting from zero.
     pub fn get(&self, index: usize) -> Option<&[CaptureType]> {
         self.unnamed.get(index).map(Vec::as_slice)
@@ -197,8 +197,8 @@ impl Captures {
 
 /// A capture location within a single scope.
 ///
-/// Ordinary captures and nested regexes both use this type, which is what
-/// gives them a shared index space and a shared name namespace.
+/// Groups, captures and nested regexes all use this type, which is what gives
+/// them a shared index space and a shared name namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Slot {
     /// A location identified by its zero-based index.
@@ -250,7 +250,7 @@ struct Scope {
 /// declared location is known even when it never matched.
 #[derive(Debug, Default)]
 struct RegexMetadata {
-    /// Number of index slots: unnamed captures plus unnamed nested regexes.
+    /// Number of index slots: unnamed groups plus unnamed nested regexes.
     unnamed_count: usize,
 
     /// Names of named captures and named nested regexes (one shared namespace).
@@ -312,7 +312,8 @@ enum Pat {
     /// A list of alternative subpatterns.
     Alternatives(Vec<Pat>),
 
-    /// A capture group. Its inner pattern is a scope of its own.
+    /// A group (`Slot::Index`) or capture (`Slot::Name`). Its inner pattern is
+    /// a scope of its own.
     Capture {
         slot: Slot,
         inner: Box<Pat>,
@@ -488,8 +489,8 @@ impl Pat {
     ///
     /// Checks for duplicate names among the locations declared directly in
     /// this scope, assigns indexes, and recursively compiles the scopes of
-    /// nested captures. Returns the compiled pattern together with the
-    /// metadata describing this scope.
+    /// nested groups and captures. Returns the compiled pattern together with
+    /// the metadata describing this scope.
     fn compile_scope(self) -> Result<(Pat, RegexMetadata), Error> {
         let names = self.scope_names();
         let mut seen = HashSet::new();
@@ -514,10 +515,10 @@ impl Pat {
 
     /// Assigns indexes within the current scope.
     ///
-    /// Unnamed captures and unnamed nested regexes draw from the same counter,
-    /// so they share one index space. Nested capture scopes restart their own
-    /// numbering; nested regexes are already compiled and are not descended
-    /// into.
+    /// Unnamed groups and unnamed nested regexes draw from the same counter,
+    /// so they share one index space. Nested group and capture scopes restart
+    /// their own numbering; nested regexes are already compiled and are not
+    /// descended into.
     fn compile(self, next: &mut usize) -> Result<Pat, Error> {
         Ok(match self {
             Pat::Sequence(items) => Pat::Sequence(Self::compile_all(items, next)?),
@@ -575,8 +576,8 @@ impl Pat {
     /// Collects the names declared directly in the current scope.
     ///
     /// Named captures and named nested regexes share one namespace. Contents
-    /// of captures and nested regexes are excluded because each opens its own
-    /// scope with its own namespace.
+    /// of groups, captures and nested regexes are excluded because each opens
+    /// its own scope with its own namespace.
     fn scope_names(&self) -> Vec<String> {
         match self {
             Pat::Sequence(items) | Pat::Alternatives(items) => {
@@ -855,7 +856,7 @@ impl<S: State> RegexBuilder<S> {
     /// Appends a reusable regex without consuming it.
     ///
     /// The nested regex occupies the next free index in the current scope,
-    /// sharing the index space with ordinary captures. Its own captures stay
+    /// sharing the index space with unnamed groups. Its own captures stay
     /// isolated inside its result and are reached through the occurrence.
     pub fn regex(self, regex: &Regex) -> RegexBuilder<Quantifiable> {
         self.push(Pat::Regex {
@@ -897,22 +898,14 @@ impl<S: State> RegexBuilder<S> {
         self.border(build, true)
     }
 
-    /// Creates a subpattern group without introducing a capture.
+    /// Creates an unnamed group.
     ///
-    /// Captures declared inside belong to the enclosing scope.
+    /// The group takes the next free index in the current scope, sharing the
+    /// index space with unnamed nested regexes. Everything declared inside the
+    /// closure forms a nested scope with its own indexes and names. Repeating
+    /// the group records one occurrence per iteration, each with its own
+    /// nested captures.
     pub fn group<T: State>(
-        self,
-        build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
-    ) -> RegexBuilder<Quantifiable> {
-        self.nest(build, |inner| inner)
-    }
-
-    /// Creates an unnamed capture group.
-    ///
-    /// The capture takes the next free index in the current scope. Everything
-    /// declared inside the closure forms a nested scope with its own indexes
-    /// and names. Repeating the capture records one occurrence per iteration.
-    pub fn capture<T: State>(
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
     ) -> RegexBuilder<Quantifiable> {
@@ -923,11 +916,11 @@ impl<S: State> RegexBuilder<S> {
         })
     }
 
-    /// Creates a named capture group.
+    /// Creates a named capture.
     ///
-    /// Behaves like [`RegexBuilder::capture`], but the location is addressed by
+    /// Behaves like [`RegexBuilder::group`], but the location is addressed by
     /// name in the shared name namespace of the current scope.
-    pub fn capture_named<T: State>(
+    pub fn capture<T: State>(
         self,
         name: impl Into<String>,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -967,7 +960,7 @@ impl<S: State> RegexBuilder<S> {
     ///
     /// Reports any error recorded while building, then validates duplicate
     /// names and assigns indexes scope by scope: the top level first, then each
-    /// capture group's inner scope independently.
+    /// group's and capture's inner scope independently.
     pub fn build(self) -> Result<Regex, Error> {
         if let Some(error) = self.error {
             return Err(error);
