@@ -1181,7 +1181,7 @@ impl Regex {
     ///
     /// Returns [`BuildError::UndefinedRecursion`] if the regex depends on a
     /// recursive reference that has not been defined yet.
-    fn full_match(&self, input: impl Into<String>) -> Result<Option<Captures>, BuildError> {
+    pub fn full_match(&self, input: impl Into<String>) -> Result<Option<Captures>, BuildError> {
         self.ensure_defined()?;
 
         let chars: Vec<char> = input.into().chars().collect();
