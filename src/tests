@@ -1,0 +1,80 @@
+use regexbuilder::*;
+
+fn main() {
+    let whitespace = RegexBuilder::new()
+        .any_whitespace()
+        .zero_or_more()
+        .build()
+        .unwrap();
+
+    let symbol = RegexBuilder::new()
+        .any_char_of(|c| c.range('a', 'z').range('A', 'Z').literal("_"))
+        .any_word()
+        .zero_or_more()
+        .build()
+        .unwrap();
+
+    let number = RegexBuilder::new()
+        .literal("-")
+        .optional()
+        .any_digit()
+        .one_or_more()
+        .group(|r| r.literal(".").any_digit().one_or_more())
+        .optional()
+        .build()
+        .unwrap();
+
+    let string = RegexBuilder::new()
+        .literal("\"")
+        .group(|r| {
+            r.or(|o| {
+                o.branch(|r| r.literal("\\").any_char())
+                    .branch(|r| r.any_except(|c| c.literal("\"\\")))
+            })
+        })
+        .zero_or_more()
+        .literal("\"")
+        .build()
+        .unwrap();
+
+    let atom = RegexBuilder::new()
+        .or(|o| {
+            o.branch(|r| r.regex(&symbol))
+                .branch(|r| r.regex(&number))
+                .branch(|r| r.regex(&string))
+        })
+        .build()
+        .unwrap();
+
+    let expression = RegexBuilder::recursive();
+
+    let list = RegexBuilder::recursive();
+
+    let expression = expression
+        .define(
+            RegexBuilder::new().or(|o| o.branch(|r| r.regex(&atom)).branch(|r| r.recurse(&list))),
+        )
+        .unwrap();
+
+    let list = list
+        .define(
+            RegexBuilder::new()
+                .literal("(")
+                .regex(&whitespace)
+                .regex(&expression)
+                .zero_or_more()
+                .regex(&whitespace)
+                .literal(")"),
+        )
+        .unwrap();
+
+    let program = RegexBuilder::new()
+        .regex(&whitespace)
+        .regex(&expression)
+        .zero_or_more()
+        .regex(&whitespace)
+        .build()
+        .unwrap();
+
+    dbg!(program.full_match("(define (square x) (* x x))").unwrap());
+}
