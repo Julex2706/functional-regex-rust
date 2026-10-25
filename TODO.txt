@@ -1,0 +1,17 @@
+Recursive regex
+let recursive = RegexBuilder::recursive();
+
+- Creates an undefined recursive regex reference.
+- May be embedded before definition.
+let regex = recursive.define(builder);
+
+- Consumes the recursive reference.
+- Returns a Regex.
+- May only be called once.
+- builder may contain the recursive reference itself, directly or indirectly.
+- Using an undefined recursive reference to build/match is an error.
+Types:
+RegexBuilder::recursive() → RecursiveRegex
+RecursiveRegex::define(...) → Regex
+
+That's it.
