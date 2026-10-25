@@ -11,23 +11,25 @@ use std::sync::Arc;
 ///
 /// The builder moves through a small state machine:
 /// - `AppendOnly`: new atoms can be appended, but no quantifier may be applied yet.
-/// - `Quantifiable`: the most recently added atom is eligible to be quantified.
-/// - `QuantifiedGreedy`: the last atom has been quantified and can still be made lazy.
+/// - `Quantifiable`: the most recently added atom can be quantified.
+/// - `Quantified`: the most recently added atom was just quantified and can
+///   still be made lazy.
 pub trait State {}
 
 /// Marks the start of a regex builder. New atoms can be appended, but the
 /// pattern cannot yet be quantified.
 pub struct AppendOnly;
 
-/// Marks a pattern segment that is ready to receive a quantifier.
+/// Marks a pattern segment that can be quantified.
 pub struct Quantifiable;
 
-/// Marks a quantified segment that may still be converted to a lazy form.
-pub struct QuantifiedGreedy;
+/// Marks a segment that was just quantified and may still be converted to a
+/// lazy form.
+pub struct Quantified;
 
 impl State for AppendOnly {}
 impl State for Quantifiable {}
-impl State for QuantifiedGreedy {}
+impl State for Quantified {}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -210,7 +212,7 @@ enum Slot {
 
 /// A sequence of possible match states for a pattern: end position plus the
 /// captures collected on the way there.
-type Matches = Vec<(usize, MatchData)>;
+type Matches = Vec<(usize, ScopeData)>;
 
 /// Captures collected for one scope while evaluating a pattern.
 ///
@@ -218,7 +220,7 @@ type Matches = Vec<(usize, MatchData)>;
 /// never reached simply have no entry; they are materialized as empty vectors
 /// when the final [`Captures`] is built.
 #[derive(Debug, Clone, Default)]
-struct MatchData {
+struct ScopeData {
     slots: HashMap<Slot, Vec<Occurrence>>,
 }
 
@@ -238,10 +240,10 @@ struct Occurrence {
 #[derive(Debug, Clone)]
 struct Scope {
     /// Captures recorded inside this occurrence only.
-    data: Box<MatchData>,
+    data: Box<ScopeData>,
 
     /// Describes which locations exist in this scope.
-    metadata: Arc<RegexMetadata>,
+    metadata: Arc<ScopeMetadata>,
 }
 
 /// Static description of the capture locations declared in one scope.
@@ -249,7 +251,7 @@ struct Scope {
 /// It is what lets untaken routes be reported as empty vectors: every
 /// declared location is known even when it never matched.
 #[derive(Debug, Default)]
-struct RegexMetadata {
+struct ScopeMetadata {
     /// Number of index slots: unnamed groups plus unnamed nested regexes.
     unnamed_count: usize,
 
@@ -257,7 +259,7 @@ struct RegexMetadata {
     names: Vec<String>,
 }
 
-impl RegexMetadata {
+impl ScopeMetadata {
     /// True if the scope declares no capture locations at all.
     fn is_empty(&self) -> bool {
         self.unnamed_count == 0 && self.names.is_empty()
@@ -290,7 +292,7 @@ impl SetItem {
 
 /// Pattern nodes used to build a regex.
 #[derive(Debug, Clone)]
-enum Pat {
+enum Pattern {
     /// A literal string pattern.
     Literal(Vec<char>),
 
@@ -307,57 +309,57 @@ enum Pat {
     },
 
     /// A concatenation of multiple subpatterns.
-    Sequence(Vec<Pat>),
+    Sequence(Vec<Pattern>),
 
     /// A list of alternative subpatterns.
-    Alternatives(Vec<Pat>),
+    Alternatives(Vec<Pattern>),
 
     /// A group (`Slot::Index`) or capture (`Slot::Name`). Its inner pattern is
     /// a scope of its own.
     Capture {
         slot: Slot,
-        inner: Box<Pat>,
+        inner: Box<Pattern>,
         /// Describes the inner scope. A default placeholder until `build`
         /// compiles the pattern and fills in the real value.
-        metadata: Arc<RegexMetadata>,
+        metadata: Arc<ScopeMetadata>,
     },
 
     /// An embedded, already compiled, reusable regex (a scope of its own).
     Regex {
         slot: Slot,
-        inner: Box<Pat>,
-        metadata: Arc<RegexMetadata>,
+        inner: Box<Pattern>,
+        metadata: Arc<ScopeMetadata>,
     },
 
     /// A quantified subpattern.
     Repeat {
-        inner: Box<Pat>,
+        inner: Box<Pattern>,
         min: usize,
         max: Option<usize>,
         lazy: bool,
     },
 }
 
-impl Pat {
+impl Pattern {
     /// Attempts to run this pattern from position `i` in the input.
     ///
     /// Returns every way the pattern can match, in priority order, each with
     /// the capture data collected so far for the *current* scope.
-    fn run(&self, s: &[char], i: usize, data: MatchData) -> Matches {
+    fn run(&self, s: &[char], i: usize, data: ScopeData) -> Matches {
         match self {
-            Pat::Literal(l) if s[i..].starts_with(l) => {
+            Pattern::Literal(l) if s[i..].starts_with(l) => {
                 vec![(i + l.len(), data)]
             }
-            Pat::Literal(_) => vec![],
+            Pattern::Literal(_) => vec![],
 
-            Pat::Set { items, negated } => match s.get(i) {
+            Pattern::Set { items, negated } => match s.get(i) {
                 Some(c) if items.iter().any(|item| item.contains(*c)) != *negated => {
                     vec![(i + 1, data)]
                 }
                 _ => vec![],
             },
 
-            Pat::Border { items, negated } => {
+            Pattern::Border { items, negated } => {
                 let inside = |c: &char| items.iter().any(|item| item.contains(*c));
                 let before = i.checked_sub(1).map_or(false, |p| inside(&s[p]));
                 let after = s.get(i).map_or(false, inside);
@@ -369,28 +371,28 @@ impl Pat {
                 }
             }
 
-            Pat::Sequence(items) => items.iter().fold(vec![(i, data)], |states, item| {
+            Pattern::Sequence(items) => items.iter().fold(vec![(i, data)], |states, item| {
                 states
                     .into_iter()
                     .flat_map(|(position, data)| item.run(s, position, data))
                     .collect()
             }),
 
-            Pat::Alternatives(items) => items
+            Pattern::Alternatives(items) => items
                 .iter()
                 .flat_map(|item| item.run(s, i, data.clone()))
                 .collect(),
 
-            // The inner pattern runs against a fresh `MatchData`, which is what
+            // The inner pattern runs against a fresh `ScopeData`, which is what
             // makes the capture a separate scope. The finished inner data is
             // attached to a new occurrence appended to this scope's slot, so
             // repeated captures accumulate instead of overwriting.
-            Pat::Capture {
+            Pattern::Capture {
                 slot,
                 inner,
                 metadata,
             } => inner
-                .run(s, i, MatchData::default())
+                .run(s, i, ScopeData::default())
                 .into_iter()
                 .map(|(end, inner_data)| {
                     let mut data = data.clone();
@@ -413,12 +415,12 @@ impl Pat {
                 .collect(),
 
             // Nested regexes behave like captures that are always groups.
-            Pat::Regex {
+            Pattern::Regex {
                 slot,
                 inner,
                 metadata,
             } => inner
-                .run(s, i, MatchData::default())
+                .run(s, i, ScopeData::default())
                 .into_iter()
                 .map(|(end, inner_data)| {
                     let mut data = data.clone();
@@ -438,12 +440,12 @@ impl Pat {
                 })
                 .collect(),
 
-            Pat::Repeat {
+            Pattern::Repeat {
                 inner,
                 min,
                 max,
                 lazy,
-            } => inner.repeat(*min, *max, *lazy, s, i, data, 0),
+            } => inner.run_repeat(*min, *max, *lazy, s, i, data, 0),
         }
     }
 
@@ -452,14 +454,14 @@ impl Pat {
     ///
     /// The capture data is threaded through every iteration, so occurrences of
     /// captures inside the repeated pattern are appended in iteration order.
-    fn repeat(
+    fn run_repeat(
         &self,
         min: usize,
         max: Option<usize>,
         lazy: bool,
         s: &[char],
         i: usize,
-        data: MatchData,
+        data: ScopeData,
         done: usize,
     ) -> Matches {
         let stop_here: Matches = if done >= min {
@@ -472,7 +474,7 @@ impl Pat {
             self.run(s, i, data)
                 .into_iter()
                 .filter(|(end, _)| !(*end == i && done >= min))
-                .flat_map(|(end, data)| self.repeat(min, max, lazy, s, end, data, done + 1))
+                .flat_map(|(end, data)| self.run_repeat(min, max, lazy, s, end, data, done + 1))
                 .collect()
         } else {
             vec![]
@@ -491,7 +493,7 @@ impl Pat {
     /// this scope, assigns indexes, and recursively compiles the scopes of
     /// nested groups and captures. Returns the compiled pattern together with
     /// the metadata describing this scope.
-    fn compile_scope(self) -> Result<(Pat, RegexMetadata), Error> {
+    fn compile_scope(self) -> Result<(Pattern, ScopeMetadata), Error> {
         let names = self.scope_names();
         let mut seen = HashSet::new();
 
@@ -502,11 +504,11 @@ impl Pat {
         }
 
         let mut next = 0;
-        let pat = self.compile(&mut next)?;
+        let pattern = self.assign_indexes(&mut next)?;
 
         Ok((
-            pat,
-            RegexMetadata {
+            pattern,
+            ScopeMetadata {
                 unnamed_count: next,
                 names,
             },
@@ -519,12 +521,14 @@ impl Pat {
     /// so they share one index space. Nested group and capture scopes restart
     /// their own numbering; nested regexes are already compiled and are not
     /// descended into.
-    fn compile(self, next: &mut usize) -> Result<Pat, Error> {
+    fn assign_indexes(self, next: &mut usize) -> Result<Pattern, Error> {
         Ok(match self {
-            Pat::Sequence(items) => Pat::Sequence(Self::compile_all(items, next)?),
-            Pat::Alternatives(items) => Pat::Alternatives(Self::compile_all(items, next)?),
+            Pattern::Sequence(items) => Pattern::Sequence(Self::assign_indexes_all(items, next)?),
+            Pattern::Alternatives(items) => {
+                Pattern::Alternatives(Self::assign_indexes_all(items, next)?)
+            }
 
-            Pat::Capture { slot, inner, .. } => {
+            Pattern::Capture { slot, inner, .. } => {
                 let slot = match slot {
                     Slot::Index(_) => Slot::Index(take_index(next)),
                     named => named,
@@ -532,18 +536,18 @@ impl Pat {
 
                 let (inner, metadata) = (*inner).compile_scope()?;
 
-                Pat::Capture {
+                Pattern::Capture {
                     slot,
                     inner: Box::new(inner),
                     metadata: Arc::new(metadata),
                 }
             }
 
-            Pat::Regex {
+            Pattern::Regex {
                 slot,
                 inner,
                 metadata,
-            } => Pat::Regex {
+            } => Pattern::Regex {
                 slot: match slot {
                     Slot::Index(_) => Slot::Index(take_index(next)),
                     named => named,
@@ -552,13 +556,13 @@ impl Pat {
                 metadata,
             },
 
-            Pat::Repeat {
+            Pattern::Repeat {
                 inner,
                 min,
                 max,
                 lazy,
-            } => Pat::Repeat {
-                inner: Box::new(inner.compile(next)?),
+            } => Pattern::Repeat {
+                inner: Box::new(inner.assign_indexes(next)?),
                 min,
                 max,
                 lazy,
@@ -568,9 +572,13 @@ impl Pat {
         })
     }
 
-    /// Compiles every pattern in a vector, in order, sharing one counter.
-    fn compile_all(items: Vec<Pat>, next: &mut usize) -> Result<Vec<Pat>, Error> {
-        items.into_iter().map(|item| item.compile(next)).collect()
+    /// Assigns indexes to every pattern in a vector, in order, sharing one
+    /// counter.
+    fn assign_indexes_all(items: Vec<Pattern>, next: &mut usize) -> Result<Vec<Pattern>, Error> {
+        items
+            .into_iter()
+            .map(|item| item.assign_indexes(next))
+            .collect()
     }
 
     /// Collects the names declared directly in the current scope.
@@ -580,17 +588,17 @@ impl Pat {
     /// its own scope with its own namespace.
     fn scope_names(&self) -> Vec<String> {
         match self {
-            Pat::Sequence(items) | Pat::Alternatives(items) => {
-                items.iter().flat_map(Pat::scope_names).collect()
+            Pattern::Sequence(items) | Pattern::Alternatives(items) => {
+                items.iter().flat_map(Pattern::scope_names).collect()
             }
 
-            Pat::Repeat { inner, .. } => inner.scope_names(),
+            Pattern::Repeat { inner, .. } => inner.scope_names(),
 
-            Pat::Capture {
+            Pattern::Capture {
                 slot: Slot::Name(name),
                 ..
             }
-            | Pat::Regex {
+            | Pattern::Regex {
                 slot: Slot::Name(name),
                 ..
             } => vec![name.clone()],
@@ -645,7 +653,7 @@ impl CharSet {
 /// A builder for a sequence of alternative branches.
 pub struct Alternatives {
     /// The branches in the alternative expression.
-    branches: Vec<Pat>,
+    branches: Vec<Pattern>,
 
     /// The first error encountered in any branch.
     error: Option<Error>,
@@ -663,7 +671,7 @@ impl Alternatives {
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
     ) -> Alternatives {
         let inner = build(RegexBuilder::new());
-        self.branches.push(Pat::Sequence(inner.nodes));
+        self.branches.push(Pattern::Sequence(inner.nodes));
         self.error = self.error.or(inner.error);
         self
     }
@@ -676,7 +684,7 @@ impl Alternatives {
 /// A stateful builder for regex patterns.
 pub struct RegexBuilder<S: State> {
     /// The sequence of compiled pattern nodes currently assembled.
-    nodes: Vec<Pat>,
+    nodes: Vec<Pattern>,
 
     /// The first validation error encountered while building.
     error: Option<Error>,
@@ -700,10 +708,10 @@ impl RegexBuilder<AppendOnly> {
 #[derive(Debug, Clone)]
 pub struct Regex {
     /// The compiled pattern tree, with all indexes assigned.
-    pattern: Pat,
+    pattern: Pattern,
 
     /// Describes the capture locations of the top-level scope.
-    metadata: Arc<RegexMetadata>,
+    metadata: Arc<ScopeMetadata>,
 }
 
 impl Regex {
@@ -719,7 +727,7 @@ impl Regex {
 
         let data = self
             .pattern
-            .run(&chars, 0, MatchData::default())
+            .run(&chars, 0, ScopeData::default())
             .into_iter()
             .find(|(end, _)| *end == chars.len())
             .map(|(_, data)| data)?;
@@ -733,7 +741,7 @@ impl Regex {
 /// Every location declared in `metadata` is materialized: locations that never
 /// matched become empty vectors, which is what distinguishes an untaken route
 /// from an occurrence that matched the empty string.
-fn make_captures(data: &MatchData, chars: &[char], metadata: &RegexMetadata) -> Captures {
+fn make_captures(data: &ScopeData, chars: &[char], metadata: &ScopeMetadata) -> Captures {
     let occurrences = |slot: Slot| -> Vec<CaptureType> {
         data.slots
             .get(&slot)
@@ -782,14 +790,14 @@ impl<S: State> RegexBuilder<S> {
     }
 
     /// Stores the first error encountered while building the regex.
-    fn record(&mut self, error: Option<Error>) {
+    fn record_error(&mut self, error: Option<Error>) {
         self.error = self.error.take().or(error);
     }
 
     /// Adds a pattern node and advances the builder into the quantifiable state.
-    fn push(self, pat: Pat) -> RegexBuilder<Quantifiable> {
+    fn push_node(self, pattern: Pattern) -> RegexBuilder<Quantifiable> {
         let mut next = self.into_state::<Quantifiable>();
-        next.nodes.push(pat);
+        next.nodes.push(pattern);
         next
     }
 
@@ -798,16 +806,16 @@ impl<S: State> RegexBuilder<S> {
     fn nest<T: State>(
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
-        wrap: impl FnOnce(Pat) -> Pat,
+        wrap: impl FnOnce(Pattern) -> Pattern,
     ) -> RegexBuilder<Quantifiable> {
         let inner = build(RegexBuilder::new());
-        let mut next = self.push(wrap(Pat::Sequence(inner.nodes)));
-        next.record(inner.error);
+        let mut next = self.push_node(wrap(Pattern::Sequence(inner.nodes)));
+        next.record_error(inner.error);
         next
     }
 
     /// Builds a character-set based pattern and tracks any validation error.
-    fn set(
+    fn push_set(
         self,
         build: impl FnOnce(CharSet) -> CharSet,
         negated: bool,
@@ -817,17 +825,17 @@ impl<S: State> RegexBuilder<S> {
             error: None,
         });
 
-        let mut next = self.push(Pat::Set {
+        let mut next = self.push_node(Pattern::Set {
             items: set.items,
             negated,
         });
 
-        next.record(set.error);
+        next.record_error(set.error);
         next
     }
 
     /// Builds a border pattern and converts the builder back to append-only mode.
-    fn border(
+    fn push_border(
         self,
         build: impl FnOnce(CharSet) -> CharSet,
         negated: bool,
@@ -838,19 +846,19 @@ impl<S: State> RegexBuilder<S> {
         });
 
         let mut next = self
-            .push(Pat::Border {
+            .push_node(Pattern::Border {
                 items: set.items,
                 negated,
             })
             .into_state::<AppendOnly>();
 
-        next.record(set.error);
+        next.record_error(set.error);
         next
     }
 
     /// Adds a literal text atom to the pattern.
     pub fn literal(self, text: impl Into<String>) -> RegexBuilder<Quantifiable> {
-        self.push(Pat::Literal(text.into().chars().collect()))
+        self.push_node(Pattern::Literal(text.into().chars().collect()))
     }
 
     /// Appends a reusable regex without consuming it.
@@ -859,7 +867,7 @@ impl<S: State> RegexBuilder<S> {
     /// sharing the index space with unnamed groups. Its own captures stay
     /// isolated inside its result and are reached through the occurrence.
     pub fn regex(self, regex: &Regex) -> RegexBuilder<Quantifiable> {
-        self.push(Pat::Regex {
+        self.push_node(Pattern::Regex {
             slot: Slot::Index(0), // placeholder, assigned in `build`
             inner: Box::new(regex.pattern.clone()),
             metadata: regex.metadata.clone(),
@@ -871,7 +879,7 @@ impl<S: State> RegexBuilder<S> {
     /// The name is registered in the current scope's name namespace together
     /// with named captures and other named nested regexes.
     pub fn regex_named(self, name: impl Into<String>, regex: &Regex) -> RegexBuilder<Quantifiable> {
-        self.push(Pat::Regex {
+        self.push_node(Pattern::Regex {
             slot: Slot::Name(name.into()),
             inner: Box::new(regex.pattern.clone()),
             metadata: regex.metadata.clone(),
@@ -880,22 +888,22 @@ impl<S: State> RegexBuilder<S> {
 
     /// Matches any one character in the set produced by the closure.
     pub fn any_char_of(self, build: impl FnOnce(CharSet) -> CharSet) -> RegexBuilder<Quantifiable> {
-        self.set(build, false)
+        self.push_set(build, false)
     }
 
     /// Matches any one character not in the set produced by the closure.
     pub fn any_except(self, build: impl FnOnce(CharSet) -> CharSet) -> RegexBuilder<Quantifiable> {
-        self.set(build, true)
+        self.push_set(build, true)
     }
 
     /// Matches a border around characters in the set produced by the closure.
     pub fn border_of(self, build: impl FnOnce(CharSet) -> CharSet) -> RegexBuilder<AppendOnly> {
-        self.border(build, false)
+        self.push_border(build, false)
     }
 
     /// Matches a non-border position relative to the set produced by the closure.
     pub fn non_border_of(self, build: impl FnOnce(CharSet) -> CharSet) -> RegexBuilder<AppendOnly> {
-        self.border(build, true)
+        self.push_border(build, true)
     }
 
     /// Creates an unnamed group.
@@ -909,7 +917,7 @@ impl<S: State> RegexBuilder<S> {
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
     ) -> RegexBuilder<Quantifiable> {
-        self.nest(build, |inner| Pat::Capture {
+        self.nest(build, |inner| Pattern::Capture {
             slot: Slot::Index(0), // placeholder, assigned in `build`
             inner: Box::new(inner),
             metadata: Arc::default(), // placeholder, filled in `build`
@@ -927,7 +935,7 @@ impl<S: State> RegexBuilder<S> {
     ) -> RegexBuilder<Quantifiable> {
         let name = name.into();
 
-        self.nest(build, move |inner| Pat::Capture {
+        self.nest(build, move |inner| Pattern::Capture {
             slot: Slot::Name(name),
             inner: Box::new(inner),
             metadata: Arc::default(), // placeholder, filled in `build`
@@ -946,11 +954,11 @@ impl<S: State> RegexBuilder<S> {
 
         let empty = alternatives.branches.is_empty();
 
-        let mut next = self.push(Pat::Alternatives(alternatives.branches));
-        next.record(alternatives.error);
+        let mut next = self.push_node(Pattern::Alternatives(alternatives.branches));
+        next.record_error(alternatives.error);
 
         if empty {
-            next.record(Some(Error::EmptyAlternative));
+            next.record_error(Some(Error::EmptyAlternative));
         }
 
         next
@@ -966,7 +974,7 @@ impl<S: State> RegexBuilder<S> {
             return Err(error);
         }
 
-        let (pattern, metadata) = Pat::Sequence(self.nodes).compile_scope()?;
+        let (pattern, metadata) = Pattern::Sequence(self.nodes).compile_scope()?;
 
         Ok(Regex {
             pattern,
@@ -980,10 +988,10 @@ impl RegexBuilder<Quantifiable> {
     ///
     /// The `min` value is the minimum number of repetitions, and `max` is the
     /// optional maximum. If `min > max`, an `InvalidQuantifier` error is stored.
-    pub fn quantify(self, min: usize, max: Option<usize>) -> RegexBuilder<QuantifiedGreedy> {
-        let mut next = self.into_state::<QuantifiedGreedy>();
+    pub fn quantify(self, min: usize, max: Option<usize>) -> RegexBuilder<Quantified> {
+        let mut next = self.into_state::<Quantified>();
 
-        next.record(
+        next.record_error(
             max.filter(|max| min > *max)
                 .map(|max| Error::InvalidQuantifier { min, max }),
         );
@@ -993,7 +1001,7 @@ impl RegexBuilder<Quantifiable> {
             .pop()
             .expect("Quantifiable state guarantees an expression to repeat");
 
-        next.nodes.push(Pat::Repeat {
+        next.nodes.push(Pattern::Repeat {
             inner: Box::new(last),
             min,
             max,
@@ -1004,47 +1012,47 @@ impl RegexBuilder<Quantifiable> {
     }
 
     /// Matches zero or one repetition of the previous expression.
-    pub fn optional(self) -> RegexBuilder<QuantifiedGreedy> {
+    pub fn optional(self) -> RegexBuilder<Quantified> {
         self.quantify(0, Some(1))
     }
 
     /// Matches zero or more repetitions of the previous expression.
-    pub fn zero_or_more(self) -> RegexBuilder<QuantifiedGreedy> {
+    pub fn zero_or_more(self) -> RegexBuilder<Quantified> {
         self.quantify(0, None)
     }
 
     /// Matches one or more repetitions of the previous expression.
-    pub fn one_or_more(self) -> RegexBuilder<QuantifiedGreedy> {
+    pub fn one_or_more(self) -> RegexBuilder<Quantified> {
         self.quantify(1, None)
     }
 
     /// Matches exactly `n` repetitions of the previous expression.
-    pub fn exactly(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
+    pub fn exactly(self, n: usize) -> RegexBuilder<Quantified> {
         self.quantify(n, Some(n))
     }
 
     /// Matches at least `n` repetitions of the previous expression.
-    pub fn at_least(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
+    pub fn at_least(self, n: usize) -> RegexBuilder<Quantified> {
         self.quantify(n, None)
     }
 
     /// Matches at most `n` repetitions of the previous expression.
-    pub fn at_most(self, n: usize) -> RegexBuilder<QuantifiedGreedy> {
+    pub fn at_most(self, n: usize) -> RegexBuilder<Quantified> {
         self.quantify(0, Some(n))
     }
 
     /// Matches between `min` and `max` repetitions of the previous expression.
-    pub fn between(self, min: usize, max: usize) -> RegexBuilder<QuantifiedGreedy> {
+    pub fn between(self, min: usize, max: usize) -> RegexBuilder<Quantified> {
         self.quantify(min, Some(max))
     }
 }
 
-impl RegexBuilder<QuantifiedGreedy> {
+impl RegexBuilder<Quantified> {
     /// Makes the last quantified expression lazy instead of greedy.
     pub fn lazy(self) -> RegexBuilder<AppendOnly> {
         let mut next = self.into_state::<AppendOnly>();
 
-        if let Some(Pat::Repeat { lazy, .. }) = next.nodes.last_mut() {
+        if let Some(Pattern::Repeat { lazy, .. }) = next.nodes.last_mut() {
             *lazy = true;
         }
 
