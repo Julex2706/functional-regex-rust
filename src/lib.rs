@@ -1,6 +1,6 @@
 //! A simple functional builder for reusable regular expressions.
 
-#![allow(unused, )]
+#![allow(unused)]
 #![deny(missing_docs)]
 
 // ---------------------------------------------------------------------------
