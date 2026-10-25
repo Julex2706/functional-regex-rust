@@ -38,8 +38,8 @@ impl State for Quantified {}
 /// Errors produced while constructing or validating a regular expression.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
-    /// Signals that the same capture or regex name was used more than once in
-    /// the same regex scope.
+    /// Signals that the same capture, alternative or regex name was used more
+    /// than once in the same regex scope.
     DuplicateName(String),
 
     /// Signals that a quantifier was built with a minimum greater than the
@@ -49,7 +49,8 @@ pub enum Error {
     /// Signals that a character range had its start after its end.
     InvalidRange { from: char, to: char },
 
-    /// Signals that an alternative expression (`or` / `any_of`) has no branches.
+    /// Signals that an alternative expression (`or` / `any_of` and their named
+    /// variants) has no branches.
     EmptyAlternative,
 }
 
@@ -83,7 +84,7 @@ impl std::error::Error for Error {}
 
 /// A single occurrence of a capture location.
 ///
-/// The variant describes the *kind* of capture, not whether it matched: both
+/// The variant describes the *kind* of capture, not whether it matched: all
 /// variants always represent a successful match of that occurrence.
 ///
 /// * [`CaptureType::Group`] is a group, capture, or nested regex that contains
@@ -91,10 +92,14 @@ impl std::error::Error for Error {}
 ///   occurrence.
 /// * [`CaptureType::Literal`] is a group or capture that contains no capture
 ///   locations of its own, so only its matched text is retained.
+/// * [`CaptureType::Alternative`] is an alternative expression (`or`,
+///   `any_of`). It records which branch was taken (zero-based, in the order
+///   the branches were added) and carries the captures of that branch only.
 ///
-/// An occurrence is a `Group` if and only if its inner scope declares at least
-/// one capture location (group, capture or nested regex). Nested regexes are
-/// always groups, even if they declare no captures themselves.
+/// A group or capture is a `Group` if and only if its inner scope declares at
+/// least one capture location (group, capture, alternative or nested regex).
+/// Nested regexes are always groups, and alternatives are always
+/// `Alternative`, even if they declare no captures themselves.
 #[derive(Debug, PartialEq)]
 pub enum CaptureType {
     /// An occurrence with a nested capture scope.
@@ -108,16 +113,29 @@ pub enum CaptureType {
 
     /// An occurrence without nested capture locations.
     Literal(String),
+
+    /// An occurrence of an alternative expression.
+    Alternative {
+        /// The complete text consumed by the taken branch.
+        full: String,
+        /// The zero-based index of the branch that was taken.
+        branch: usize,
+        /// The captures declared inside the taken branch. Every branch is a
+        /// scope of its own, so captures of other branches never appear here.
+        captures: Captures,
+    },
 }
 
 impl CaptureType {
     /// Returns the complete text matched by this occurrence.
     ///
-    /// Works for both variants. For repeated captures, each occurrence returns
+    /// Works for every variant. For repeated captures, each occurrence returns
     /// only its own text, never a concatenation of all occurrences.
     pub fn full(&self) -> &str {
         match self {
-            CaptureType::Group { full, .. } | CaptureType::Literal(full) => full,
+            CaptureType::Group { full, .. }
+            | CaptureType::Literal(full)
+            | CaptureType::Alternative { full, .. } => full,
         }
     }
 
@@ -125,7 +143,7 @@ impl CaptureType {
     pub fn as_group(&self) -> Option<&Captures> {
         match self {
             CaptureType::Group { captures, .. } => Some(captures),
-            CaptureType::Literal(_) => None,
+            _ => None,
         }
     }
 
@@ -133,39 +151,69 @@ impl CaptureType {
     pub fn as_literal(&self) -> Option<&str> {
         match self {
             CaptureType::Literal(text) => Some(text),
-            CaptureType::Group { .. } => None,
+            _ => None,
         }
+    }
+
+    /// Returns the taken branch index and the captures of that branch if this
+    /// is an `Alternative`, otherwise `None`.
+    pub fn as_alternative(&self) -> Option<(usize, &Captures)> {
+        match self {
+            CaptureType::Alternative {
+                branch, captures, ..
+            } => Some((*branch, captures)),
+            _ => None,
+        }
+    }
+
+    /// Returns the zero-based index of the taken branch if this is an
+    /// `Alternative`, otherwise `None`.
+    pub fn branch(&self) -> Option<usize> {
+        self.as_alternative().map(|(branch, _)| branch)
     }
 
     /// Returns the nested captures of a `Group`.
     ///
     /// # Panics
     ///
-    /// Panics if this is a `Literal`. Use [`CaptureType::as_group`] for a
+    /// Panics if this is not a `Group`. Use [`CaptureType::as_group`] for a
     /// non-panicking alternative.
     pub fn group(&self) -> &Captures {
         self.as_group()
-            .expect("group() called on a Literal capture")
+            .expect("group() called on an occurrence that is not a Group")
     }
 
     /// Returns the matched text of a `Literal`.
     ///
     /// # Panics
     ///
-    /// Panics if this is a `Group`. Use [`CaptureType::as_literal`] for a
-    /// non-panicking alternative, or [`CaptureType::full`] which works for both.
+    /// Panics if this is not a `Literal`. Use [`CaptureType::as_literal`] for a
+    /// non-panicking alternative, or [`CaptureType::full`] which works for
+    /// every variant.
     pub fn literal(&self) -> &str {
         self.as_literal()
-            .expect("literal() called on a Group capture")
+            .expect("literal() called on an occurrence that is not a Literal")
+    }
+
+    /// Returns the taken branch index and the captures of that branch of an
+    /// `Alternative`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is not an `Alternative`. Use
+    /// [`CaptureType::as_alternative`] for a non-panicking alternative.
+    pub fn alternative(&self) -> (usize, &Captures) {
+        self.as_alternative()
+            .expect("alternative() called on an occurrence that is not an Alternative")
     }
 }
 
 /// The capture results of one regex scope.
 ///
-/// Unnamed groups and unnamed nested regexes share a single zero-based index
-/// space. Named captures and named nested regexes share a single name
-/// namespace. Both accessors return the same kind of result: the ordered
-/// occurrences of that capture location.
+/// Unnamed groups, unnamed alternatives and unnamed nested regexes share a
+/// single zero-based index space. Named captures, named alternatives and named
+/// nested regexes share a single name namespace. Both accessors return the
+/// same kind of result: the ordered occurrences of that capture location.
 ///
 /// Accessors distinguish three situations:
 ///
@@ -180,14 +228,14 @@ pub struct Captures {
 }
 
 impl Captures {
-    /// Returns the occurrences of the nth unnamed group or unnamed nested
-    /// regex in this scope, counting from zero.
+    /// Returns the occurrences of the nth unnamed group, unnamed alternative
+    /// or unnamed nested regex in this scope, counting from zero.
     pub fn get(&self, index: usize) -> Option<&[CaptureType]> {
         self.unnamed.get(index).map(Vec::as_slice)
     }
 
-    /// Returns the occurrences of a named capture or named nested regex in
-    /// this scope.
+    /// Returns the occurrences of a named capture, named alternative or named
+    /// nested regex in this scope.
     pub fn named(&self, name: impl AsRef<str>) -> Option<&[CaptureType]> {
         self.named.get(name.as_ref()).map(Vec::as_slice)
     }
@@ -199,8 +247,8 @@ impl Captures {
 
 /// A capture location within a single scope.
 ///
-/// Groups, captures and nested regexes all use this type, which is what gives
-/// them a shared index space and a shared name namespace.
+/// Groups, captures, alternatives and nested regexes all use this type, which
+/// is what gives them a shared index space and a shared name namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Slot {
     /// A location identified by its zero-based index.
@@ -231,12 +279,25 @@ struct Occurrence {
     /// Retaining it lets `full()` return the exact matched text.
     span: (usize, usize),
 
-    /// The nested scope of this occurrence: `Some` for group-like
-    /// occurrences, `None` for literal ones.
-    scope: Option<Scope>,
+    /// What kind of occurrence this is, together with its nested scope if it
+    /// has one.
+    kind: OccurrenceKind,
 }
 
-/// The nested scope belonging to one group occurrence.
+/// The kind of a recorded occurrence.
+#[derive(Debug, Clone)]
+enum OccurrenceKind {
+    /// A capture without nested capture locations: only the text is needed.
+    Literal,
+
+    /// A group-like occurrence with a nested scope.
+    Group(Scope),
+
+    /// An alternative occurrence: the taken branch and that branch's scope.
+    Alternative { branch: usize, scope: Scope },
+}
+
+/// The nested scope belonging to one group or alternative occurrence.
 #[derive(Debug, Clone)]
 struct Scope {
     /// Captures recorded inside this occurrence only.
@@ -252,10 +313,11 @@ struct Scope {
 /// declared location is known even when it never matched.
 #[derive(Debug, Default)]
 struct ScopeMetadata {
-    /// Number of index slots: unnamed groups plus unnamed nested regexes.
+    /// Number of index slots: unnamed groups, alternatives and nested regexes.
     unnamed_count: usize,
 
-    /// Names of named captures and named nested regexes (one shared namespace).
+    /// Names of named captures, alternatives and nested regexes (one shared
+    /// namespace).
     names: Vec<String>,
 }
 
@@ -311,8 +373,16 @@ enum Pattern {
     /// A concatenation of multiple subpatterns.
     Sequence(Vec<Pattern>),
 
-    /// A list of alternative subpatterns.
-    Alternatives(Vec<Pattern>),
+    /// A list of alternative branches. The alternative is a capture location
+    /// (`Slot::Index` or `Slot::Name`) and every branch is a scope of its own.
+    Alternatives {
+        slot: Slot,
+        branches: Vec<Pattern>,
+        /// Describes the scope of each branch, one entry per branch. Empty
+        /// placeholder until `build` compiles the pattern and fills in the
+        /// real values.
+        metadata: Vec<Arc<ScopeMetadata>>,
+    },
 
     /// A group (`Slot::Index`) or capture (`Slot::Name`). Its inner pattern is
     /// a scope of its own.
@@ -378,10 +448,41 @@ impl Pattern {
                     .collect()
             }),
 
-            Pattern::Alternatives(items) => items
-                .iter()
-                .flat_map(|item| item.run(s, i, data.clone()))
-                .collect(),
+            // Every branch runs against a fresh `ScopeData`, so each branch is
+            // a scope of its own. Each way a branch can match becomes one
+            // occurrence that remembers the branch index. Branches are tried
+            // in order, which gives earlier branches priority.
+            Pattern::Alternatives {
+                slot,
+                branches,
+                metadata,
+            } => {
+                let mut matches = Matches::new();
+
+                for (branch, pattern) in branches.iter().enumerate() {
+                    for (end, inner_data) in pattern.run(s, i, ScopeData::default()) {
+                        let mut data = data.clone();
+
+                        data.slots
+                            .entry(slot.clone())
+                            .or_default()
+                            .push(Occurrence {
+                                span: (i, end),
+                                kind: OccurrenceKind::Alternative {
+                                    branch,
+                                    scope: Scope {
+                                        data: Box::new(inner_data),
+                                        metadata: metadata[branch].clone(),
+                                    },
+                                },
+                            });
+
+                        matches.push((end, data));
+                    }
+                }
+
+                matches
+            }
 
             // The inner pattern runs against a fresh `ScopeData`, which is what
             // makes the capture a separate scope. The finished inner data is
@@ -404,10 +505,14 @@ impl Pattern {
                             span: (i, end),
                             // Group only if the scope declares locations;
                             // otherwise only the text is needed (Literal).
-                            scope: (!metadata.is_empty()).then(|| Scope {
-                                data: Box::new(inner_data),
-                                metadata: metadata.clone(),
-                            }),
+                            kind: if metadata.is_empty() {
+                                OccurrenceKind::Literal
+                            } else {
+                                OccurrenceKind::Group(Scope {
+                                    data: Box::new(inner_data),
+                                    metadata: metadata.clone(),
+                                })
+                            },
                         });
 
                     (end, data)
@@ -430,7 +535,7 @@ impl Pattern {
                         .or_default()
                         .push(Occurrence {
                             span: (i, end),
-                            scope: Some(Scope {
+                            kind: OccurrenceKind::Group(Scope {
                                 data: Box::new(inner_data),
                                 metadata: metadata.clone(),
                             }),
@@ -491,8 +596,8 @@ impl Pattern {
     ///
     /// Checks for duplicate names among the locations declared directly in
     /// this scope, assigns indexes, and recursively compiles the scopes of
-    /// nested groups and captures. Returns the compiled pattern together with
-    /// the metadata describing this scope.
+    /// nested groups, captures and alternative branches. Returns the compiled
+    /// pattern together with the metadata describing this scope.
     fn compile_scope(self) -> Result<(Pattern, ScopeMetadata), Error> {
         let names = self.scope_names();
         let mut seen = HashSet::new();
@@ -517,15 +622,39 @@ impl Pattern {
 
     /// Assigns indexes within the current scope.
     ///
-    /// Unnamed groups and unnamed nested regexes draw from the same counter,
-    /// so they share one index space. Nested group and capture scopes restart
-    /// their own numbering; nested regexes are already compiled and are not
-    /// descended into.
+    /// Unnamed groups, unnamed alternatives and unnamed nested regexes draw
+    /// from the same counter, so they share one index space. Nested group,
+    /// capture and branch scopes restart their own numbering; nested regexes
+    /// are already compiled and are not descended into.
     fn assign_indexes(self, next: &mut usize) -> Result<Pattern, Error> {
         Ok(match self {
             Pattern::Sequence(items) => Pattern::Sequence(Self::assign_indexes_all(items, next)?),
-            Pattern::Alternatives(items) => {
-                Pattern::Alternatives(Self::assign_indexes_all(items, next)?)
+
+            Pattern::Alternatives {
+                slot, branches, ..
+            } => {
+                let slot = match slot {
+                    Slot::Index(_) => Slot::Index(take_index(next)),
+                    named => named,
+                };
+
+                // Every branch is a scope of its own.
+                let (branches, metadata): (Vec<Pattern>, Vec<Arc<ScopeMetadata>>) = branches
+                    .into_iter()
+                    .map(|branch| {
+                        branch
+                            .compile_scope()
+                            .map(|(pattern, metadata)| (pattern, Arc::new(metadata)))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?
+                    .into_iter()
+                    .unzip();
+
+                Pattern::Alternatives {
+                    slot,
+                    branches,
+                    metadata,
+                }
             }
 
             Pattern::Capture { slot, inner, .. } => {
@@ -583,14 +712,13 @@ impl Pattern {
 
     /// Collects the names declared directly in the current scope.
     ///
-    /// Named captures and named nested regexes share one namespace. Contents
-    /// of groups, captures and nested regexes are excluded because each opens
-    /// its own scope with its own namespace.
+    /// Named captures, named alternatives and named nested regexes share one
+    /// namespace. Contents of groups, captures, alternative branches and
+    /// nested regexes are excluded because each opens its own scope with its
+    /// own namespace.
     fn scope_names(&self) -> Vec<String> {
         match self {
-            Pattern::Sequence(items) | Pattern::Alternatives(items) => {
-                items.iter().flat_map(Pattern::scope_names).collect()
-            }
+            Pattern::Sequence(items) => items.iter().flat_map(Pattern::scope_names).collect(),
 
             Pattern::Repeat { inner, .. } => inner.scope_names(),
 
@@ -599,6 +727,10 @@ impl Pattern {
                 ..
             }
             | Pattern::Regex {
+                slot: Slot::Name(name),
+                ..
+            }
+            | Pattern::Alternatives {
                 slot: Slot::Name(name),
                 ..
             } => vec![name.clone()],
@@ -663,9 +795,11 @@ impl Alternatives {
     /// Adds a branch to the alternative list.
     ///
     /// The provided closure receives a fresh `RegexBuilder<AppendOnly>` so the
-    /// branch can be built independently. Captures inside a branch belong to
-    /// the scope that contains the alternatives; a branch that is not taken
-    /// leaves its captures as empty vectors in the result.
+    /// branch can be built independently. Branches are numbered from zero in
+    /// the order they are added, and that number is reported in the result.
+    /// Every branch is a scope of its own: captures inside a branch are
+    /// reached through the alternative's occurrence, and only the taken
+    /// branch's captures are present there.
     pub fn branch<T: State>(
         mut self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -675,6 +809,13 @@ impl Alternatives {
         self.error = self.error.or(inner.error);
         self
     }
+}
+
+/// Adds one literal branch per option, in order.
+fn literal_branches<T: Into<String>>(alternatives: Alternatives, options: Vec<T>) -> Alternatives {
+    options.into_iter().fold(alternatives, |alternatives, option| {
+        alternatives.branch(|r| r.literal(option))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -769,12 +910,17 @@ fn make_occurrence(occurrence: &Occurrence, chars: &[char]) -> CaptureType {
     let (start, end) = occurrence.span;
     let full: String = chars[start..end].iter().collect();
 
-    match &occurrence.scope {
-        Some(scope) => CaptureType::Group {
+    match &occurrence.kind {
+        OccurrenceKind::Literal => CaptureType::Literal(full),
+        OccurrenceKind::Group(scope) => CaptureType::Group {
             full,
             captures: make_captures(&scope.data, chars, &scope.metadata),
         },
-        None => CaptureType::Literal(full),
+        OccurrenceKind::Alternative { branch, scope } => CaptureType::Alternative {
+            full,
+            branch: *branch,
+            captures: make_captures(&scope.data, chars, &scope.metadata),
+        },
     }
 }
 
@@ -856,6 +1002,35 @@ impl<S: State> RegexBuilder<S> {
         next
     }
 
+    /// Builds an alternative pattern in the given slot and tracks any
+    /// validation error.
+    fn push_alternatives(
+        self,
+        slot: Slot,
+        build: impl FnOnce(Alternatives) -> Alternatives,
+    ) -> RegexBuilder<Quantifiable> {
+        let alternatives = build(Alternatives {
+            branches: vec![],
+            error: None,
+        });
+
+        let empty = alternatives.branches.is_empty();
+
+        let mut next = self.push_node(Pattern::Alternatives {
+            slot,
+            branches: alternatives.branches,
+            metadata: vec![], // placeholder, filled in `build`
+        });
+
+        next.record_error(alternatives.error);
+
+        if empty {
+            next.record_error(Some(Error::EmptyAlternative));
+        }
+
+        next
+    }
+
     /// Adds a literal text atom to the pattern.
     pub fn literal(self, text: impl Into<String>) -> RegexBuilder<Quantifiable> {
         self.push_node(Pattern::Literal(text.into().chars().collect()))
@@ -864,8 +1039,9 @@ impl<S: State> RegexBuilder<S> {
     /// Appends a reusable regex without consuming it.
     ///
     /// The nested regex occupies the next free index in the current scope,
-    /// sharing the index space with unnamed groups. Its own captures stay
-    /// isolated inside its result and are reached through the occurrence.
+    /// sharing the index space with unnamed groups and alternatives. Its own
+    /// captures stay isolated inside its result and are reached through the
+    /// occurrence.
     pub fn regex(self, regex: &Regex) -> RegexBuilder<Quantifiable> {
         self.push_node(Pattern::Regex {
             slot: Slot::Index(0), // placeholder, assigned in `build`
@@ -877,7 +1053,7 @@ impl<S: State> RegexBuilder<S> {
     /// Appends a reusable regex under a name.
     ///
     /// The name is registered in the current scope's name namespace together
-    /// with named captures and other named nested regexes.
+    /// with named captures, named alternatives and other named nested regexes.
     pub fn regex_named(self, name: impl Into<String>, regex: &Regex) -> RegexBuilder<Quantifiable> {
         self.push_node(Pattern::Regex {
             slot: Slot::Name(name.into()),
@@ -909,10 +1085,10 @@ impl<S: State> RegexBuilder<S> {
     /// Creates an unnamed group.
     ///
     /// The group takes the next free index in the current scope, sharing the
-    /// index space with unnamed nested regexes. Everything declared inside the
-    /// closure forms a nested scope with its own indexes and names. Repeating
-    /// the group records one occurrence per iteration, each with its own
-    /// nested captures.
+    /// index space with unnamed alternatives and nested regexes. Everything
+    /// declared inside the closure forms a nested scope with its own indexes
+    /// and names. Repeating the group records one occurrence per iteration,
+    /// each with its own nested captures.
     pub fn group<T: State>(
         self,
         build: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
@@ -942,33 +1118,56 @@ impl<S: State> RegexBuilder<S> {
         })
     }
 
-    /// Creates a pattern containing one or more alternative branches.
+    /// Creates an unnamed alternative with one or more branches.
+    ///
+    /// The alternative takes the next free index in the current scope, sharing
+    /// the index space with unnamed groups and nested regexes. Each
+    /// occurrence records which branch was taken (zero-based), the full text
+    /// it consumed and the captures of that branch.
     pub fn or(
         self,
         build: impl FnOnce(Alternatives) -> Alternatives,
     ) -> RegexBuilder<Quantifiable> {
-        let alternatives = build(Alternatives {
-            branches: vec![],
-            error: None,
-        });
+        self.push_alternatives(Slot::Index(0), build) // placeholder, assigned in `build`
+    }
 
-        let empty = alternatives.branches.is_empty();
+    /// Creates a named alternative with one or more branches.
+    ///
+    /// Behaves like [`RegexBuilder::or`], but the location is addressed by
+    /// name in the shared name namespace of the current scope.
+    pub fn or_named(
+        self,
+        name: impl Into<String>,
+        build: impl FnOnce(Alternatives) -> Alternatives,
+    ) -> RegexBuilder<Quantifiable> {
+        self.push_alternatives(Slot::Name(name.into()), build)
+    }
 
-        let mut next = self.push_node(Pattern::Alternatives(alternatives.branches));
-        next.record_error(alternatives.error);
+    /// Matches any one of the provided string options.
+    ///
+    /// Each option is one branch, numbered in the order given, so the result
+    /// reports which option matched.
+    pub fn any_of<T: Into<String>>(self, options: Vec<T>) -> RegexBuilder<Quantifiable> {
+        self.or(|alternatives| literal_branches(alternatives, options))
+    }
 
-        if empty {
-            next.record_error(Some(Error::EmptyAlternative));
-        }
-
-        next
+    /// Matches any one of the provided string options, under a name.
+    ///
+    /// Behaves like [`RegexBuilder::any_of`], but the location is addressed by
+    /// name in the shared name namespace of the current scope.
+    pub fn any_of_named<T: Into<String>>(
+        self,
+        name: impl Into<String>,
+        options: Vec<T>,
+    ) -> RegexBuilder<Quantifiable> {
+        self.or_named(name, |alternatives| literal_branches(alternatives, options))
     }
 
     /// Finalizes the builder and turns it into a compiled regex.
     ///
     /// Reports any error recorded while building, then validates duplicate
     /// names and assigns indexes scope by scope: the top level first, then each
-    /// group's and capture's inner scope independently.
+    /// group's, capture's and alternative branch's inner scope independently.
     pub fn build(self) -> Result<Regex, Error> {
         if let Some(error) = self.error {
             return Err(error);
@@ -1071,15 +1270,6 @@ impl CharSet {
 }
 
 impl<S: State> RegexBuilder<S> {
-    /// Matches any one of the provided string options.
-    pub fn any_of<T: Into<String>>(self, options: Vec<T>) -> RegexBuilder<Quantifiable> {
-        self.or(|alts| {
-            options
-                .into_iter()
-                .fold(alts, |alts, option| alts.branch(|r| r.literal(option)))
-        })
-    }
-
     /// Matches any character in the inclusive range from `from` to `to`.
     pub fn range(self, from: char, to: char) -> RegexBuilder<Quantifiable> {
         self.any_char_of(|s| s.range(from, to))
