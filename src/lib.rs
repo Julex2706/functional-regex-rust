@@ -1,23 +1,28 @@
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-use std::marker::PhantomData;
-use std::sync::Arc;
+//! A simple functional builder for reusable regular expressions.
+
+#![allow(unused)]
+#![deny(missing_docs)]
 
 // ---------------------------------------------------------------------------
 // Builder states
 // ---------------------------------------------------------------------------
 
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::marker::PhantomData;
+use std::sync::Arc;
+
 /// A regex construction state marker.
 ///
 /// The builder moves through a small state machine:
-/// - `AppendOnly`: new atoms can be appended, but no quantifier may be applied yet.
-/// - `Quantifiable`: the most recently added atom can be quantified.
-/// - `Quantified`: the most recently added atom was just quantified and can
+/// - [`AppendOnly`]: new atoms can be appended, but no quantifier may be applied yet.
+/// - [`Quantifiable`]: the most recently added atom may be quantified.
+/// - [`Quantified`]: the most recently added atom was just quantified and can
 ///   still be made lazy.
 pub trait BuilderState {}
 
 /// Marks the start of a regex builder. New atoms can be appended, but the
-/// pattern cannot yet be quantified.
+/// pattern cannot be quantified.
 pub struct AppendOnly;
 
 /// Marks a pattern segment that can be quantified.
@@ -44,10 +49,20 @@ pub enum BuildError {
 
     /// Signals that a quantifier was built with a minimum greater than the
     /// maximum.
-    InvalidQuantifier { min: usize, max: usize },
+    InvalidQuantifier {
+        /// The minimum that was used.
+        min: usize,
+        /// The maximum that was used.
+        max: usize,
+    },
 
     /// Signals that a character range had its start after its end.
-    InvalidRange { from: char, to: char },
+    InvalidRange {
+        /// The start that was used.
+        from: char,
+        /// The end that was used.
+        to: char,
+    },
 
     /// Signals that an alternative expression (`or` / `any_of` and their named
     /// variants) has no branches.
@@ -55,23 +70,20 @@ pub enum BuildError {
 }
 
 impl fmt::Display for BuildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            BuildError::DuplicateName(name) => {
-                write!(f, "capture or regex name '{name}' is used more than once")
-            }
-            BuildError::InvalidQuantifier { min, max } => {
-                write!(
-                    f,
-                    "quantifier minimum {min} is greater than its maximum {max}"
-                )
-            }
+            BuildError::DuplicateName(name) => write!(
+                f,
+                "capture, alternative or regex name '{name}' is used more than once"
+            ),
+            BuildError::InvalidQuantifier { min, max } => write!(
+                f,
+                "quantifier minimum {min} is greater than its maximum {max}"
+            ),
             BuildError::InvalidRange { from, to } => {
                 write!(f, "range start '{from}' comes after its end '{to}'")
             }
-            BuildError::EmptyAlternative => {
-                write!(f, "alternative expression has no branches")
-            }
+            BuildError::EmptyAlternative => write!(f, "alternative expression has no branches"),
         }
     }
 }
@@ -82,19 +94,20 @@ impl std::error::Error for BuildError {}
 // Public capture results
 // ---------------------------------------------------------------------------
 
-/// A single occurrence of a capture location.
+/// A single occurrence of a capture location
 ///
-/// The variant describes the *kind* of capture, not whether it matched: all
+/// The variant describes the *kind* of capture, not whether if matched: all
 /// variants always represent a successful match of that occurrence.
 ///
-/// * [`CaptureOccurrence::Group`] is a group, capture, or nested regex that
-///   contains its own capture locations. It carries the nested [`Captures`] of
+/// * [`CaptureOccurrence::Group`] is a group, capture or nested regex that
+///   capture its own capture locations. It carries the nested [`Captures`] of
 ///   this occurrence.
 /// * [`CaptureOccurrence::Literal`] is a group or capture that contains no
 ///   capture locations of its own, so only its matched text is retained.
 /// * [`CaptureOccurrence::Alternative`] is an alternative expression (`or`,
-///   `any_of`). It records which branch was taken (zero-based, in the order
-///   the branches were added) and carries the captures of that branch only.
+///   `any_of`  and their named variants). It records which branch was taken
+///   (zero-based, in the order the branches were added) and carries the
+///   captures of that branch only.
 ///
 /// A group or capture is a `Group` if and only if its inner scope declares at
 /// least one capture location (group, capture, alternative or nested regex).
@@ -230,7 +243,7 @@ pub struct Captures {
 }
 
 impl Captures {
-    /// Returns the occurrences of the nth unnamed group, unnamed alternative
+    /// Returns the occurrences of the nth unnamed group, unnamed alternative,
     /// or unnamed nested regex in this scope, counting from zero.
     pub fn at_index(&self, index: usize) -> Option<&[CaptureOccurrence]> {
         self.indexed.get(index).map(Vec::as_slice)
@@ -286,7 +299,7 @@ struct RecordedOccurrence {
     kind: RecordedKind,
 }
 
-/// The kind of a recorded occurrence.
+/// The kind of recorded occurrence.
 #[derive(Debug, Clone)]
 enum RecordedKind {
     /// A capture without nested capture locations: only the text is needed.
@@ -364,22 +377,16 @@ enum PatternNode {
     Literal(Vec<char>),
 
     /// A set or negated set matcher.
-    CharClass {
-        items: Vec<SetItem>,
-        negated: bool,
-    },
+    CharClass { items: Vec<SetItem>, negated: bool },
 
     /// A border matcher such as word boundary style checks.
-    Boundary {
-        items: Vec<SetItem>,
-        negated: bool,
-    },
+    Boundary { items: Vec<SetItem>, negated: bool },
 
     /// A concatenation of multiple subpatterns.
     Sequence(Vec<PatternNode>),
 
     /// A list of alternative branches. The alternative is a capture location
-    /// (`CaptureSlot::Index` or `CaptureSlot::Name`) and every branch is a
+    /// ([`CaptureSlot::Index`] or [`CaptureSlot::Name`]) and every branch is a
     /// scope of its own.
     Alternation {
         slot: CaptureSlot,
@@ -390,7 +397,7 @@ enum PatternNode {
         branch_layouts: Vec<Arc<ScopeLayout>>,
     },
 
-    /// A group (`CaptureSlot::Index`) or capture (`CaptureSlot::Name`). Its
+    /// A group ([`CaptureSlot::Index`]) or capture ([`CaptureSlot::Name`]). Its
     /// inner pattern is a scope of its own.
     Capturing {
         slot: CaptureSlot,
@@ -450,14 +457,16 @@ impl PatternNode {
             }
 
             PatternNode::Sequence(nodes) => {
-                nodes.iter().fold(vec![(position, scope_data)], |states, node| {
-                    states
-                        .into_iter()
-                        .flat_map(|(state_position, state_data)| {
-                            node.match_at(input, state_position, state_data)
-                        })
-                        .collect()
-                })
+                nodes
+                    .iter()
+                    .fold(vec![(position, scope_data)], |states, node| {
+                        states
+                            .into_iter()
+                            .flat_map(|(state_position, state_data)| {
+                                node.match_at(input, state_position, state_data)
+                            })
+                            .collect()
+                    })
             }
 
             // Every branch runs against a fresh `ScopeRecord`, so each branch is
@@ -477,11 +486,8 @@ impl PatternNode {
                     {
                         let mut updated = scope_data.clone();
 
-                        updated
-                            .occurrences
-                            .entry(slot.clone())
-                            .or_default()
-                            .push(RecordedOccurrence {
+                        updated.occurrences.entry(slot.clone()).or_default().push(
+                            RecordedOccurrence {
                                 char_span: (position, end),
                                 kind: RecordedKind::Alternative {
                                     branch_index,
@@ -490,7 +496,8 @@ impl PatternNode {
                                         layout: branch_layouts[branch_index].clone(),
                                     },
                                 },
-                            });
+                            },
+                        );
 
                         results.push((end, updated));
                     }
@@ -507,60 +514,57 @@ impl PatternNode {
                 slot,
                 inner,
                 layout,
-            } => inner
-                .match_at(input, position, ScopeRecord::default())
-                .into_iter()
-                .map(|(end, inner_data)| {
-                    let mut updated = scope_data.clone();
+            } => {
+                inner
+                    .match_at(input, position, ScopeRecord::default())
+                    .into_iter()
+                    .map(|(end, inner_data)| {
+                        let mut updated = scope_data.clone();
 
-                    updated
-                        .occurrences
-                        .entry(slot.clone())
-                        .or_default()
-                        .push(RecordedOccurrence {
-                            char_span: (position, end),
-                            // Group only if the scope declares locations;
-                            // otherwise only the text is needed (Literal).
-                            kind: if layout.declares_nothing() {
-                                RecordedKind::Literal
-                            } else {
-                                RecordedKind::Group(NestedScope {
-                                    record: Box::new(inner_data),
-                                    layout: layout.clone(),
-                                })
+                        updated.occurrences.entry(slot.clone()).or_default().push(
+                            RecordedOccurrence {
+                                char_span: (position, end),
+                                kind: if layout.declares_nothing() {
+                                    RecordedKind::Literal
+                                } else {
+                                    RecordedKind::Group(NestedScope {
+                                        record: Box::new(inner_data),
+                                        layout: layout.clone(),
+                                    })
+                                },
                             },
-                        });
+                        );
 
-                    (end, updated)
-                })
-                .collect(),
+                        (end, updated)
+                    })
+                    .collect()
+            }
 
-            // Nested regexes behave like captures that are always groups.
             PatternNode::Embedded {
                 slot,
                 inner,
                 layout,
-            } => inner
-                .match_at(input, position, ScopeRecord::default())
-                .into_iter()
-                .map(|(end, inner_data)| {
-                    let mut updated = scope_data.clone();
+            } => {
+                inner
+                    .match_at(input, position, ScopeRecord::default())
+                    .into_iter()
+                    .map(|(end, inner_data)| {
+                        let mut updated = scope_data.clone();
 
-                    updated
-                        .occurrences
-                        .entry(slot.clone())
-                        .or_default()
-                        .push(RecordedOccurrence {
-                            char_span: (position, end),
-                            kind: RecordedKind::Group(NestedScope {
-                                record: Box::new(inner_data),
-                                layout: layout.clone(),
-                            }),
-                        });
+                        updated.occurrences.entry(slot.clone()).or_default().push(
+                            RecordedOccurrence {
+                                char_span: (position, end),
+                                kind: RecordedKind::Group(NestedScope {
+                                    record: Box::new(inner_data),
+                                    layout: layout.clone(),
+                                }),
+                            },
+                        );
 
-                    (end, updated)
-                })
-                .collect(),
+                        (end, updated)
+                    })
+                    .collect()
+            }
 
             PatternNode::Repeat {
                 inner,
@@ -618,7 +622,7 @@ impl PatternNode {
     /// nested groups, captures and alternative branches. Returns the compiled
     /// pattern together with the layout describing this scope.
     fn compile_scope(self) -> Result<(PatternNode, ScopeLayout), BuildError> {
-        let declared_names = self.declared_scope_names();
+        let declared_names = self.declare_scope_names();
         let mut seen_names = HashSet::new();
 
         for name in &declared_names {
@@ -651,26 +655,22 @@ impl PatternNode {
                 PatternNode::Sequence(Self::assign_indexes_in_order(nodes, counter)?)
             }
 
-            PatternNode::Alternation {
-                slot, branches, ..
-            } => {
+            PatternNode::Alternation { slot, branches, .. } => {
                 let slot = match slot {
                     CaptureSlot::Index(_) => CaptureSlot::Index(next_index(counter)),
                     named_slot => named_slot,
                 };
 
-                // Every branch is a scope of its own.
-                let (branches, branch_layouts): (Vec<PatternNode>, Vec<Arc<ScopeLayout>>) =
-                    branches
-                        .into_iter()
-                        .map(|branch| {
-                            branch
-                                .compile_scope()
-                                .map(|(compiled, layout)| (compiled, Arc::new(layout)))
-                        })
-                        .collect::<Result<Vec<_>, BuildError>>()?
-                        .into_iter()
-                        .unzip();
+                let (branches, branch_layouts) = branches
+                    .into_iter()
+                    .map(|branch| {
+                        branch
+                            .compile_scope()
+                            .map(|(compiled, layout)| (compiled, Arc::new(layout)))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .unzip();
 
                 PatternNode::Alternation {
                     slot,
@@ -685,7 +685,7 @@ impl PatternNode {
                     named_slot => named_slot,
                 };
 
-                let (inner, layout) = (*inner).compile_scope()?;
+                let (inner, layout) = inner.compile_scope()?;
 
                 PatternNode::Capturing {
                     slot,
@@ -741,14 +741,14 @@ impl PatternNode {
     /// namespace. Contents of groups, captures, alternative branches and
     /// nested regexes are excluded because each opens its own scope with its
     /// own namespace.
-    fn declared_scope_names(&self) -> Vec<String> {
+    fn declare_scope_names(&self) -> Vec<String> {
         match self {
             PatternNode::Sequence(nodes) => nodes
                 .iter()
-                .flat_map(PatternNode::declared_scope_names)
+                .flat_map(PatternNode::declare_scope_names)
                 .collect(),
 
-            PatternNode::Repeat { inner, .. } => inner.declared_scope_names(),
+            PatternNode::Repeat { inner, .. } => inner.declare_scope_names(),
 
             PatternNode::Capturing {
                 slot: CaptureSlot::Name(name),
@@ -894,7 +894,7 @@ impl Regex {
     /// it does, the hierarchical capture data is returned; otherwise `None`.
     /// When several matches are possible, the first one in greedy/lazy
     /// priority order wins.
-    pub fn full_match(&self, input: impl Into<String>) -> Option<Captures> {
+    fn full_match(&self, input: impl Into<String>) -> Option<Captures> {
         let chars: Vec<char> = input.into().chars().collect();
 
         let winning_data = self
@@ -914,7 +914,7 @@ impl Regex {
 /// matched become empty vectors, which is what distinguishes an untaken route
 /// from an occurrence that matched the empty string.
 fn build_captures(record: &ScopeRecord, chars: &[char], layout: &ScopeLayout) -> Captures {
-    let occurrences_of = |slot: CaptureSlot| -> Vec<CaptureOccurrence> {
+    let occurrences_of = |slot: CaptureSlot| {
         record
             .occurrences
             .get(&slot)
@@ -934,7 +934,12 @@ fn build_captures(record: &ScopeRecord, chars: &[char], layout: &ScopeLayout) ->
         by_name: layout
             .declared_names
             .iter()
-            .map(|name| (name.clone(), occurrences_of(CaptureSlot::Name(name.clone()))))
+            .map(|name| {
+                (
+                    name.clone(),
+                    occurrences_of(CaptureSlot::Name(name.clone())),
+                )
+            })
             .collect(),
     }
 }
@@ -946,7 +951,7 @@ fn build_captures(record: &ScopeRecord, chars: &[char], layout: &ScopeLayout) ->
 /// inside a group.
 fn build_occurrence(occurrence: &RecordedOccurrence, chars: &[char]) -> CaptureOccurrence {
     let (start, end) = occurrence.char_span;
-    let matched: String = chars[start..end].iter().collect();
+    let matched = chars[start..end].iter().collect();
 
     match &occurrence.kind {
         RecordedKind::Literal => CaptureOccurrence::Literal(matched),
@@ -982,10 +987,9 @@ impl<S: BuilderState> RegexBuilder<S> {
     }
 
     /// Adds a pattern node and advances the builder into the quantifiable state.
-    fn append_node(self, node: PatternNode) -> RegexBuilder<Quantifiable> {
-        let mut next = self.transition::<Quantifiable>();
-        next.nodes.push(node);
-        next
+    fn append_node(mut self, node: PatternNode) -> RegexBuilder<Quantifiable> {
+        self.nodes.push(node);
+        self.transition()
     }
 
     /// Builds a nested pattern, preserving the outer builder state while wrapping
@@ -1032,15 +1036,13 @@ impl<S: BuilderState> RegexBuilder<S> {
             error: None,
         });
 
-        let mut next = self
-            .append_node(PatternNode::Boundary {
-                items: set.items,
-                negated,
-            })
-            .transition::<AppendOnly>();
+        let mut next = self.append_node(PatternNode::Boundary {
+            items: set.items,
+            negated,
+        });
 
         next.note_error(set.error);
-        next
+        next.transition()
     }
 
     /// Builds an alternative pattern in the given slot and tracks any
@@ -1095,7 +1097,7 @@ impl<S: BuilderState> RegexBuilder<S> {
     ///
     /// The name is registered in the current scope's name namespace together
     /// with named captures, named alternatives and other named nested regexes.
-    pub fn regex_named(self, name: impl Into<String>, regex: &Regex) -> RegexBuilder<Quantifiable> {
+    pub fn named_regex(self, name: impl Into<String>, regex: &Regex) -> RegexBuilder<Quantifiable> {
         self.append_node(PatternNode::Embedded {
             slot: CaptureSlot::Name(name.into()),
             inner: Box::new(regex.root.clone()),
@@ -1162,10 +1164,8 @@ impl<S: BuilderState> RegexBuilder<S> {
         name: impl Into<String>,
         build_inner: impl FnOnce(RegexBuilder<AppendOnly>) -> RegexBuilder<T>,
     ) -> RegexBuilder<Quantifiable> {
-        let name = name.into();
-
-        self.append_nested(build_inner, move |inner| PatternNode::Capturing {
-            slot: CaptureSlot::Name(name),
+        self.append_nested(build_inner, |inner| PatternNode::Capturing {
+            slot: CaptureSlot::Name(name.into()),
             inner: Box::new(inner),
             layout: Arc::default(), // placeholder, filled in `build`
         })
@@ -1186,7 +1186,7 @@ impl<S: BuilderState> RegexBuilder<S> {
 
     /// Creates a named alternative with one or more branches.
     ///
-    /// Behaves like [`RegexBuilder::or`], but the location is addressed by
+    /// Behaves like [`RegexBuilder::or_named`], but the location is addressed by
     /// name in the shared name namespace of the current scope.
     pub fn or_named(
         self,
@@ -1240,27 +1240,25 @@ impl RegexBuilder<Quantifiable> {
     ///
     /// The `min` value is the minimum number of repetitions, and `max` is the
     /// optional maximum. If `min > max`, an `InvalidQuantifier` error is stored.
-    pub fn quantify(self, min: usize, max: Option<usize>) -> RegexBuilder<Quantified> {
-        let mut quantified = self.transition::<Quantified>();
-
-        quantified.note_error(
+    pub fn quantify(mut self, min: usize, max: Option<usize>) -> RegexBuilder<Quantified> {
+        self.note_error(
             max.filter(|max| min > *max)
                 .map(|max| BuildError::InvalidQuantifier { min, max }),
         );
 
-        let target = quantified
+        let target = self
             .nodes
             .pop()
             .expect("Quantifiable state guarantees an expression to repeat");
 
-        quantified.nodes.push(PatternNode::Repeat {
+        self.nodes.push(PatternNode::Repeat {
             inner: Box::new(target),
             min,
             max,
             lazy: false,
         });
 
-        quantified
+        self.transition()
     }
 
     /// Matches zero or one repetition of the previous expression.
@@ -1301,14 +1299,14 @@ impl RegexBuilder<Quantifiable> {
 
 impl RegexBuilder<Quantified> {
     /// Makes the last quantified expression lazy instead of greedy.
-    pub fn lazy(self) -> RegexBuilder<AppendOnly> {
-        let mut append_only = self.transition::<AppendOnly>();
+    pub fn lazy(mut self) -> RegexBuilder<AppendOnly> {
+        let Some(PatternNode::Repeat { lazy, .. }) = self.nodes.last_mut() else {
+            unreachable!("Quantified state guarantees the last node to be of type Repeat")
+        };
 
-        if let Some(PatternNode::Repeat { lazy, .. }) = append_only.nodes.last_mut() {
-            *lazy = true;
-        }
+        *lazy = true;
 
-        append_only
+        self.transition()
     }
 }
 
@@ -1318,7 +1316,7 @@ impl CharSetBuilder {
         self.range('a', 'z')
             .range('A', 'Z')
             .range('0', '9')
-            .literal("_")
+            .literal('_')
     }
 }
 
