@@ -26,8 +26,6 @@ impl<S: BuilderState> RegexBuilder<S> {
             layout: Arc::new(layout),
         };
 
-        regex.ensure_defined()?;
-
         Ok(regex)
     }
 }
