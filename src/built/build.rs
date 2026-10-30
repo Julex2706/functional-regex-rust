@@ -16,8 +16,10 @@ impl<S: BuilderState> RegexBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Also returns [`BuildError::UndefinedRecursion`] if the pattern depends
-    /// on a recursive reference that has not been defined yet.
+    /// Returns a recorded builder error or a scope-validation error, such as a
+    /// duplicate name. An undefined recursive reference does not prevent
+    /// building; it is reported by [`Regex::full_match`](crate::Regex::full_match)
+    /// if it remains undefined when matching is attempted.
     pub fn build(self) -> Result<Regex, BuildError> {
         let (root, layout) = self.finish()?;
 

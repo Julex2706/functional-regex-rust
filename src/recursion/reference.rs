@@ -31,21 +31,35 @@ impl RecursiveRegex {
     ///
     /// Consumes the reference, so it can only be defined once. The builder
     /// may embed this reference (or other recursive references) directly or
-    /// indirectly. Other references may still be undefined here; using the
-    /// result to build or match is an error until they are defined.
+    /// indirectly. Other references may still be undefined here; a regex
+    /// depending on them can be built, but matching it returns
+    /// [`BuildError::UndefinedRecursion`] until they are defined.
     ///
     /// Because this consumes the reference, build the `builder` first and
     /// then call `define`; the builder only borrows the reference while it
     /// is being constructed.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use regex_builder::RegexBuilder;
+    ///
+    /// let expression = RegexBuilder::recursive();
+    /// let body = RegexBuilder::new().or(|branches| {
+    ///     branches
+    ///         .branch(|b| b.literal("(").recurse(&expression).literal(")"))
+    ///         .branch(|b| b.literal("x"))
+    /// });
+    /// let expression = expression.define(body).unwrap();
+    ///
+    /// assert!(expression.full_match("((x))").unwrap().is_some());
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns any error recorded by the builder, or a scope validation error
     /// such as [`BuildError::DuplicateName`].
-    pub fn define<T: BuilderState>(
-        self,
-        builder: RegexBuilder<T>,
-    ) -> Result<Regex, BuildError> {
+    pub fn define<T: BuilderState>(self, builder: RegexBuilder<T>) -> Result<Regex, BuildError> {
         let (root, layout) = builder.finish()?;
         let layout = Arc::new(layout);
 

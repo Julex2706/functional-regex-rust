@@ -1,0 +1,10 @@
+[package]
+name = "regex-builder"
+version = "0.1.0"
+edition = "2021"
+description = "A functional-style builder for reusable regular expressions"
+license = "MIT"
+
+[lib]
+name = "regex_builder"
+path = "src/lib.rs"

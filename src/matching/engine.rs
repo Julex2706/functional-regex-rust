@@ -5,7 +5,10 @@
 //! branches first). Capture-bearing nodes run their inner pattern against a
 //! fresh [`ScopeRecord`], which is what makes them separate scopes, and
 //! append one occurrence per way of matching. [`PatternNode::match_repeat`]
-//! handles quantifiers and threads the capture data through every iteration.
+//! handles quantifiers with an explicit heap-allocated work stack, threading
+//! capture data through every iteration. Nested pattern nodes and recursive
+//! references still use the call stack. Because possible paths are collected
+//! for backtracking, ambiguous patterns can require substantial time and memory.
 //!
 //! Recursive references are evaluated here too, using the support types from
 //! the `recursion` module (seeded left-recursion handling).
@@ -16,7 +19,101 @@ use super::record::{MatchStates, NestedScope, RecordedKind, RecordedOccurrence, 
 use crate::pattern::PatternNode;
 use crate::recursion::{distinct_ends, wrap_recursive, RecursionMemo, SeedEntry};
 
+struct RepeatFrame {
+    position: usize,
+    scope_data: ScopeRecord,
+    completed: usize,
+    extended: Vec<(usize, ScopeRecord)>,
+    next_child: usize,
+    initialized: bool,
+    yielded_stop: bool,
+}
+
+pub(crate) struct RepeatMatches<'a> {
+    inner: &'a PatternNode,
+    min: usize,
+    max: Option<usize>,
+    lazy: bool,
+    input: &'a [char],
+    frames: Vec<RepeatFrame>,
+}
+
+impl RepeatMatches<'_> {
+    pub(crate) fn next_match(&mut self, memo: &mut RecursionMemo) -> Option<(usize, ScopeRecord)> {
+        loop {
+            let frame_index = self.frames.len().checked_sub(1)?;
+
+            if !self.frames[frame_index].initialized {
+                let frame = &self.frames[frame_index];
+                let extended = if self.max.map_or(true, |limit| frame.completed < limit) {
+                    self.inner
+                        .match_at(self.input, frame.position, frame.scope_data.clone(), memo)
+                        .into_iter()
+                        .filter(|(end, _)| !(*end == frame.position && frame.completed >= self.min))
+                        .collect()
+                } else {
+                    vec![]
+                };
+                let frame = &mut self.frames[frame_index];
+                frame.extended = extended;
+                frame.initialized = true;
+            }
+
+            let can_stop = self.frames[frame_index].completed >= self.min;
+            if self.lazy && can_stop && !self.frames[frame_index].yielded_stop {
+                self.frames[frame_index].yielded_stop = true;
+                let frame = &self.frames[frame_index];
+                return Some((frame.position, frame.scope_data.clone()));
+            }
+
+            if self.frames[frame_index].next_child < self.frames[frame_index].extended.len() {
+                let frame = &mut self.frames[frame_index];
+                let (position, scope_data) = frame.extended[frame.next_child].clone();
+                frame.next_child += 1;
+                let completed = frame.completed + 1;
+                self.frames.push(RepeatFrame {
+                    position,
+                    scope_data,
+                    completed,
+                    extended: vec![],
+                    next_child: 0,
+                    initialized: false,
+                    yielded_stop: false,
+                });
+                continue;
+            }
+
+            if can_stop && !self.frames[frame_index].yielded_stop {
+                self.frames[frame_index].yielded_stop = true;
+                let frame = &self.frames[frame_index];
+                return Some((frame.position, frame.scope_data.clone()));
+            }
+
+            self.frames.pop();
+        }
+    }
+}
+
 impl PatternNode {
+    pub(crate) fn match_sequence(
+        nodes: &[PatternNode],
+        input: &[char],
+        position: usize,
+        scope_data: ScopeRecord,
+        memo: &mut RecursionMemo,
+    ) -> MatchStates {
+        nodes
+            .iter()
+            .fold(vec![(position, scope_data)], |states, node| {
+                states
+                    .into_iter()
+                    .flat_map(|(state_position, state_data)| {
+                        node.match_at(input, state_position, state_data, memo)
+                    })
+                    .collect()
+            })
+    }
+
     /// Attempts to run this pattern from `position` in the input.
     ///
     /// Returns every way the pattern can match, in priority order, each with
@@ -57,16 +154,7 @@ impl PatternNode {
             }
 
             PatternNode::Sequence(nodes) => {
-                nodes
-                    .iter()
-                    .fold(vec![(position, scope_data)], |states, node| {
-                        states
-                            .into_iter()
-                            .flat_map(|(state_position, state_data)| {
-                                node.match_at(input, state_position, state_data, memo)
-                            })
-                            .collect()
-                    })
+                Self::match_sequence(nodes, input, position, scope_data, memo)
             }
 
             // Every branch runs against a fresh `ScopeRecord`, so each branch is
@@ -196,12 +284,10 @@ impl PatternNode {
                 );
 
                 let inner_results = loop {
-                    let results = definition.root.match_at(
-                        input,
-                        position,
-                        ScopeRecord::default(),
-                        memo,
-                    );
+                    let results =
+                        definition
+                            .root
+                            .match_at(input, position, ScopeRecord::default(), memo);
 
                     let entry = memo
                         .get_mut(&key)
@@ -231,48 +317,48 @@ impl PatternNode {
                 min,
                 max,
                 lazy,
-            } => inner.match_repeat(*min, *max, *lazy, input, position, scope_data, 0, memo),
+            } => {
+                let mut matches =
+                    inner.match_repeat(*min, *max, *lazy, input, position, scope_data);
+                let mut results = MatchStates::new();
+                while let Some(result) = matches.next_match(memo) {
+                    results.push(result);
+                }
+                results
+            }
         }
     }
 
-    /// Recursively evaluates a repeated pattern while handling greedy and lazy
-    /// expansion rules.
+    /// Returns repeated matches one at a time using a heap-backed depth-first
+    /// traversal. No later match path is evaluated until the iterator is
+    /// advanced.
     ///
     /// The capture data is threaded through every iteration, so occurrences of
     /// captures inside the repeated pattern are appended in iteration order.
-    fn match_repeat(
-        &self,
+    pub(crate) fn match_repeat<'a>(
+        &'a self,
         min: usize,
         max: Option<usize>,
         lazy: bool,
-        input: &[char],
+        input: &'a [char],
         position: usize,
         scope_data: ScopeRecord,
-        completed: usize,
-        memo: &mut RecursionMemo,
-    ) -> MatchStates {
-        let stopped: MatchStates = if completed >= min {
-            vec![(position, scope_data.clone())]
-        } else {
-            vec![]
-        };
-
-        let extended: MatchStates = if max.map_or(true, |limit| completed < limit) {
-            self.match_at(input, position, scope_data, memo)
-                .into_iter()
-                .filter(|(end, _)| !(*end == position && completed >= min))
-                .flat_map(|(end, next_data)| {
-                    self.match_repeat(min, max, lazy, input, end, next_data, completed + 1, memo)
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-
-        if lazy {
-            [stopped, extended].concat()
-        } else {
-            [extended, stopped].concat()
+    ) -> RepeatMatches<'a> {
+        RepeatMatches {
+            inner: self,
+            min,
+            max,
+            lazy,
+            input,
+            frames: vec![RepeatFrame {
+                position,
+                scope_data,
+                completed: 0,
+                extended: vec![],
+                next_child: 0,
+                initialized: false,
+                yielded_stop: false,
+            }],
         }
     }
 }

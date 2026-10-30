@@ -10,6 +10,9 @@ use super::layout::ScopeLayout;
 use crate::pattern::PatternNode;
 
 /// A fully compiled regex pattern with its scope layout.
+///
+/// Cloning a regex clones its pattern and layout. Recursive references inside
+/// the pattern continue to share their write-once definitions.
 #[derive(Debug, Clone)]
 pub struct Regex {
     /// The compiled pattern tree, with all indexes assigned.

@@ -25,6 +25,20 @@ pub struct RegexBuilder<S: BuilderState> {
 
 impl RegexBuilder<AppendOnly> {
     /// Creates a new regex builder in the append-only state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use regex_builder::RegexBuilder;
+    ///
+    /// let digits = RegexBuilder::new()
+    ///     .any_digit()
+    ///     .one_or_more()
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// assert!(digits.full_match("2048").unwrap().is_some());
+    /// ```
     pub fn new() -> RegexBuilder<AppendOnly> {
         RegexBuilder {
             nodes: vec![],

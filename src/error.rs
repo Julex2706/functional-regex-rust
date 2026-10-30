@@ -1,9 +1,34 @@
 //! Errors that can occur while constructing or validating a regular
 //! expression.
 //!
-//! Builders never panic on invalid input. They record the *first* error they
-//! see and report it when the regex is finished (`build` or
-//! [`RecursiveRegex::define`](crate::RecursiveRegex::define)).
+//! Builders record the *first* construction error they see and report it when
+//! the regex is finished (`build` or
+//! [`RecursiveRegex::define`](crate::RecursiveRegex::define)). A regex that
+//! still depends on an undefined recursive reference can be built, but
+//! matching it returns [`BuildError::UndefinedRecursion`].
+//!
+//! # Examples
+//!
+//! ```
+//! use regex_builder::{BuildError, RegexBuilder};
+//!
+//! let invalid_range = RegexBuilder::new().range('z', 'a').build();
+//! assert_eq!(
+//!     invalid_range.unwrap_err(),
+//!     BuildError::InvalidRange { from: 'z', to: 'a' }
+//! );
+//! assert_eq!(
+//!     BuildError::InvalidRange { from: 'z', to: 'a' }.to_string(),
+//!     "range start 'z' comes after its end 'a'"
+//! );
+//! assert_eq!(
+//!     BuildError::InvalidQuantifier { min: 3, max: 2 }.to_string(),
+//!     "quantifier minimum 3 is greater than its maximum 2"
+//! );
+//!
+//! let empty_alternative = RegexBuilder::new().or(|branches| branches).build();
+//! assert_eq!(empty_alternative.unwrap_err(), BuildError::EmptyAlternative);
+//! ```
 
 use std::fmt;
 
@@ -35,8 +60,8 @@ pub enum BuildError {
     /// variants) has no branches.
     EmptyAlternative,
 
-    /// Signals that a recursive regex reference was used to build or match
-    /// before it was defined.
+    /// Signals that matching was attempted while this regex depended on a
+    /// recursive reference that had not been defined.
     UndefinedRecursion,
 }
 

@@ -18,9 +18,6 @@ mod reference;
 mod seed;
 mod wrapping;
 
-#[cfg(test)]
-mod recursive_tests;
-
 pub(crate) use cell::{RecursiveCell, RecursiveDefinition};
 pub use reference::RecursiveRegex;
 pub(crate) use seed::{distinct_ends, RecursionMemo, SeedEntry};

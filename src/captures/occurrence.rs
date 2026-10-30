@@ -27,6 +27,45 @@ use super::Captures;
 /// Nested regexes (including recursive references) are always groups, and
 /// alternatives are always `Alternative`, even if they declare no captures
 /// themselves.
+///
+/// # Examples
+///
+/// ```
+/// use regex_builder::RegexBuilder;
+///
+/// let regex = RegexBuilder::new()
+///     .capture("number", |b| b.any_digit())
+///     .build()
+///     .unwrap();
+/// let captures = regex.full_match("8").unwrap().unwrap();
+/// let occurrence = &captures.with_name("number").unwrap()[0];
+///
+/// assert_eq!(occurrence.matched_text(), "8");
+/// assert_eq!(occurrence.try_literal(), Some("8"));
+/// assert!(occurrence.try_group().is_none());
+/// ```
+///
+/// The accessors for nested scopes and alternatives are useful when a pattern
+/// has more than one capture kind:
+///
+/// ```
+/// use regex_builder::RegexBuilder;
+///
+/// let regex = RegexBuilder::new()
+///     .group(|b| b.capture("inner", |inner| inner.literal("x")))
+///     .or(|branches| branches.branch(|b| b.literal("y")))
+///     .build()
+///     .unwrap();
+/// let captures = regex.full_match("xy").unwrap().unwrap();
+///
+/// let group = &captures.at_index(0).unwrap()[0];
+/// assert!(group.try_group().is_some());
+/// assert_eq!(group.expect_group().with_name("inner").unwrap()[0].matched_text(), "x");
+///
+/// let alternative = &captures.at_index(1).unwrap()[0];
+/// assert_eq!(alternative.try_alternative().unwrap().0, 0);
+/// assert_eq!(alternative.expect_alternative().0, 0);
+/// ```
 #[derive(Debug, PartialEq)]
 pub enum CaptureOccurrence {
     /// An occurrence with a nested capture scope.

@@ -1,9 +1,8 @@
 //! Detection of recursive references that are still undefined.
 //!
-//! A regex that (transitively) depends on an undefined reference can neither
-//! be built nor matched. `build` and `full_match` call
-//! `Regex::ensure_defined`, which walks the pattern tree with
-//! `PatternNode::has_undefined`.
+//! A regex that (transitively) depends on an undefined reference can be built,
+//! but cannot be matched. `Regex::full_match` calls `Regex::ensure_defined`,
+//! which walks the pattern tree with `PatternNode::has_undefined`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
